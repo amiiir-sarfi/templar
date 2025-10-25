@@ -47,14 +47,9 @@ def initialize_wandb(
     # Initialize WandB with version as a tag
     run = wandb.init(
         project=config.project,
-        entity=None if config.log_to_private_wandb else "tplr",
-        id=run_id,
-        resume="must" if run_id else "never",
         name=f"{run_prefix}{uid}",
         config=config,
         group=group,
-        job_type=job_type,
-        dir=wandb_dir,
         tags=[f"v{__version__}"],
         settings=wandb.Settings(
             init_timeout=300,

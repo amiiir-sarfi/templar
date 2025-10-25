@@ -253,7 +253,7 @@ def create_parallel_dims(
     elif role == "validator":
         # Validator: pipeline parallelism with data parallel replication
         # Ensure dp_shard is at least 1 to prevent division by zero
-        dp_shard = 4
+        dp_shard = 1
         if world_size % dp_shard != 0:
             raise ValueError(
                 f"World size ({world_size}) must be divisible by "
