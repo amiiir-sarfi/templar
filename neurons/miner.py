@@ -151,17 +151,75 @@ class Miner(BaseNode, Trainer):
     def __init__(self):
         tplr.logger.debug("Starting initialization...")
 
-        # Init config and load hparams
+        # 1) Parse config & logging levels
         self.config = Miner.miner_config()
-        # ---------------------------------------------------------------------
-        # Distributed initialisation
-        # ---------------------------------------------------------------------
+
+        # 2) Distributed setup
+        self._setup_distributed()
+
+        # 3) Device selection
+        self._setup_device()
+
+        # 4) Mixed precision / GradScaler
+        self._setup_amp()
+
+        # 5) Load hparams
+        self._load_hparams()
+
+        # 6) Wallet & BaseNode/Trainer init
+        self._init_wallet_and_base()
+
+        # 7) Model scaffold 
+        self._init_model_scaffold()
+
+        # 8) Read parallelization degrees
+        self._read_parallelization_degrees()
+
+        # 9) SparseLoCo optimizer init
+        self._init_sparseloco()
+
+        # 10) Optimizers / schedulers (delegates to Trainer)
+        self.init_optimizers_schedulers()
+
+        # 11) Comms + chain state
+        self._init_comms_and_chain_state()
+
+        # 12) WandB & metrics (master only)
+        self._init_logging_and_metrics()
+
+        # 13) Peer-state & dataset manager
+        self._init_peers_and_dataset()
+
+        """Record code / bootstrap versions and warmup windows."""
+        self.bootstrap_version = getattr(self.hparams, "checkpoint_init_version", None)
+        tplr.logger.info(
+            f"[Miner] code_version={tplr.__version__} "
+            f"checkpoint_init_flag={self.bootstrap_version or '<none>'}"
+        )
+
+        # Calculate the number of warmup windows before the first real training step
+        self.warmup_windows = (
+            self.hparams.validator_offset + self.hparams.peer_list_window_margin
+        )
+        tplr.logger.info(
+            f"[Init] Warmup windows before first real training: {self.warmup_windows}"
+        )
+
+        tplr.logger.info("[Init] ✔ fully done – entering run()")
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Initialization helpers (pure refactor; logic unchanged)
+    # ────────────────────────────────────────────────────────────────────────────
+    def _setup_distributed(self):
+        """Initialize process group and basic rank attributes."""
         dist_helper.init_process_group(backend="nccl", timeout_minutes=45)
         self.rank = dist_helper.rank
         self.world_size = dist_helper.world_size
         self.local_rank = dist_helper.local_rank
         self.is_master = dist_helper.is_master
 
+    def _setup_device(self):
+        """Pick CUDA device from dist_helper if present; otherwise use config."""
         if dist_helper.device:
             self.device = dist_helper.device
             self.config.device = str(dist_helper.device)
@@ -170,7 +228,8 @@ class Miner(BaseNode, Trainer):
             self.device = torch.device(self.config.device)
         tplr.logger.info(f"[Init] device set → {self.device}")
 
-        # Mixed precision setup
+    def _setup_amp(self):
+        """Configure AMP dtype and GradScaler enablement."""
         self.amp_dtype = (
             torch.bfloat16 if self.config.amp_dtype == "bf16" else torch.float16
         )
@@ -181,7 +240,8 @@ class Miner(BaseNode, Trainer):
             f"[Init] Using {self.config.amp_dtype}. GradScaler enabled: {self.scaler.is_enabled()}"
         )
 
-        # Convenience flags - already set from dist_helper
+    def _load_hparams(self):
+        """Load hparams and handle optional batch size override."""
         self.config.local = cast(bool, self.config.local)
         self.hparams = tplr.load_hparams(use_local_run_hparams=self.config.local)
 
@@ -191,18 +251,22 @@ class Miner(BaseNode, Trainer):
             )
             self.hparams.batch_size = self.config.actual_batch_size
 
-        # Init bittensor objects
+    def _init_wallet_and_base(self):
+        """Initialize Bittensor wallet and parent classes."""
         self.wallet = bt.wallet(config=self.config)
         tplr.logger.info("[Init] Bittensor wallet loaded")
         super().__init__()
 
+    def _init_model_scaffold(self):
+        """Create the model on meta device then allocate empty on target device."""
         # Initialize model on meta device first
         self.init_model(meta=True)
         # Move model from meta to actual device (allocates memory but no initialization)
         self.model = self.model.to_empty(device=str(self.device))
         self.model_initialized = False  # Track if model has actual weights
 
-        # Store parallelization parameters for later use
+    def _read_parallelization_degrees(self):
+        """Read parallelization degrees from hparams (torchtitan namespace)."""
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
         self.tp_degree = int(getattr(tt, "tp_degree", 1))
         self.pp_degree = int(getattr(tt, "pp_degree", 1))
@@ -210,7 +274,9 @@ class Miner(BaseNode, Trainer):
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
         self.dp_shard = int(getattr(tt, "dp_shard", 1))
 
-        # Init compression
+    def _init_sparseloco(self):
+        """Prepare compression transformer, compressor, EF CPU buffers, and precompute shapes."""
+        # Compression components
         self.transformer = tplr.compress.ChunkingTransformer(
             self.model, target_chunk=self.hparams.target_chunk
         )
@@ -221,9 +287,7 @@ class Miner(BaseNode, Trainer):
         )
         tplr.logger.info("[Init] compression pipeline ready")
 
-        # Init optimizer and momentum
-        self.init_optimizers_schedulers()
-
+        # Error feedback buffers + compression shapes
         self.error_feedback = {}
         self.error_feedback_cpu_buffers = {}
         self.owned_params = set()
@@ -257,20 +321,8 @@ class Miner(BaseNode, Trainer):
             f"[Init] Compression initialized for {len(self.xshapes)} parameters"
         )
 
-        self.bootstrap_version = getattr(self.hparams, "checkpoint_init_version", None)
-        tplr.logger.info(
-            f"[Miner] code_version={tplr.__version__} "
-            f"checkpoint_init_flag={self.bootstrap_version or '<none>'}"
-        )
-
-        # Calculate the number of warmup windows before the first real training step
-        self.warmup_windows = (
-            self.hparams.validator_offset + self.hparams.peer_list_window_margin
-        )
-        tplr.logger.info(
-            f"[Init] Warmup windows before first real training: {self.warmup_windows}"
-        )
-
+    def _init_comms_and_chain_state(self):
+        """Initialize communications, verify registration, checkpointing, bucket, and chain state."""
         # Init comms
         self.comms = tplr.comms.Comms(
             wallet=self.wallet,
@@ -298,7 +350,7 @@ class Miner(BaseNode, Trainer):
             self.comms.try_commit(self.wallet, self.bucket)
         dist_helper.safe_barrier("post_init", self.local_rank)
 
-        # Init state params
+        # Chain state & counters
         self.current_block = self.comms.subtensor.block
         self.current_window = int(self.current_block / self.hparams.blocks_per_window)
         tplr.logger.info(
@@ -313,6 +365,8 @@ class Miner(BaseNode, Trainer):
         # Track additional metrics
         self.total_tokens_processed = 0
 
+    def _init_logging_and_metrics(self):
+        """Initialize WandB & Influx metrics on master."""
         if self.is_master:
             # Initialize WandB
             self.wandb = tplr.initialize_wandb(
@@ -334,6 +388,8 @@ class Miner(BaseNode, Trainer):
                 job_type="mining",
             )
 
+    def _init_peers_and_dataset(self):
+        """Prepare peer bookkeeping and dataset manager (no downloads yet)."""
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
         self.next_reserve_peers: list[int] | None = None
@@ -347,8 +403,6 @@ class Miner(BaseNode, Trainer):
             token_dtype=np.uint32,  # Match preprocessing script dtype
         )
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
-
-        tplr.logger.info("[Init] ✔ fully done – entering run()")
 
     # Main training loop.
     async def run(self):
