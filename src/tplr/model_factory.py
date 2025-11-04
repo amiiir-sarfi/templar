@@ -21,19 +21,23 @@ Unified model creation and initialization for TorchTitan models across
 evaluator, validator, and miner components.
 """
 
+from dataclasses import dataclass
 from collections import OrderedDict
+from logging import config
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.pipelining.schedules import _PipelineSchedule, ScheduleGPipe
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
     set_model_state_dict,
 )
+from torchtitan.components.loss import LossFunction
 from torchtitan.config import (
     ActivationCheckpoint,
     Float8,
@@ -50,11 +54,23 @@ from torchtitan.models.llama3 import (
 )
 from torchtitan.models.llama3 import Transformer as TitanLlama
 from torchtitan.models.llama3.infra.parallelize import parallelize_llama
+from torchtitan.components.loss import cross_entropy_loss
 from tqdm.auto import tqdm
 from transformers.models.llama import LlamaConfig, LlamaForCausalLM
 
 import tplr
+from tplr.pipeline.pipeline_llama import pipeline_llama
 from tplr.distributed import dist_helper
+
+
+@dataclass
+class MetaModel:
+    """PP-aware model factory return type."""
+
+    model_parts: list[nn.Module]
+    pp_scheduler: ScheduleGPipe | None  # None if PP disabled
+    pp_has_first_stage: bool
+    pp_has_last_stage: bool
 
 
 def get_titan_model_args(hparams: SimpleNamespace) -> TransformerModelArgs:
@@ -189,6 +205,7 @@ def create_job_config(
         disable_loss_parallel=getattr(tt, "disable_loss_parallel", True),
         fsdp_reshard_after_forward=getattr(tt, "fsdp_reshard_after_forward", "default"),
         enable_compiled_autograd=getattr(tt, "enable_compiled_autograd", False),
+        pipeline_parallel_schedule="GPipe",
     )
 
     # Build ActivationCheckpoint config
@@ -304,7 +321,7 @@ def create_parallel_dims(
                 "but not both."
             )
 
-        if dp_replicate > 1 and (tp_degree > 1 or pp_degree > 1 or cp_degree > 1):
+        if dp_replicate > 1 and (tp_degree > 1 or cp_degree > 1):
             raise ValueError("dp_replicate can only be used when tp/pp/cp are all 1.")
 
         # Ensure world_size is divisible by the product of all parallel degrees
@@ -321,6 +338,21 @@ def create_parallel_dims(
                 f"({dp_replicate}x{dp_shard}x{tp_degree}x{pp_degree}x{cp_degree} = {total_parallel_degree})."
             )
 
+        # PP currently only accepts FSDP
+        if pp_degree > 1:
+            if role != "miner":
+                raise ValueError("PP>1 is only supported for miners.")
+            if dp_replicate != 1:
+                raise ValueError(
+                    "PP>1 requires dp_replicate == 1 (no DDP replication with PP)."
+                )
+            if tp_degree != 1 or cp_degree != 1:
+                raise ValueError("PP>1 currently requires TP=1 and CP=1.")
+            if world_size != pp_degree * dp_shard:
+                raise ValueError(
+                    f"PP layout mismatch: world_size({world_size}) must equal pp_degree({pp_degree}) * dp_shard({dp_shard})."
+                )
+
         return ParallelDims(
             dp_replicate=dp_replicate,
             dp_shard=dp_shard,
@@ -336,7 +368,8 @@ def create_meta_model(
     hparams: SimpleNamespace,
     role: Literal["miner", "validator", "evaluator"] = "miner",
     world_size: int = 1,
-) -> nn.Module:
+    pp_device: torch.device | None = None,
+) -> MetaModel:
     """Create a TorchTitan model on meta device for fast checkpoint loading.
 
     This creates the model structure without allocating memory for weights,
@@ -368,6 +401,43 @@ def create_meta_model(
         model = TitanLlama(titan_args)
         model.args = titan_args
 
+    if pdims.pp_enabled:
+        if pp_device is None:
+            raise ValueError("pp_device must be provided when pp is enabled.")
+
+        dp_degree = pdims.dp_replicate * pdims.dp_shard
+        local_batch = hparams.batch_size // dp_degree
+        grad_accum_steps = local_batch // hparams.micro_batch_size
+
+        def create_pp_loss_fn(grad_accum_steps):
+            def pipeline_loss_fn(logits, labels):
+                return cross_entropy_loss(logits, labels) / grad_accum_steps
+
+            return pipeline_loss_fn
+
+        tt = getattr(hparams, "torchtitan", SimpleNamespace())
+        compression_ratio = getattr(tt, "pp_compression_ratio", 1.0)
+        pp_scheduler, model_parts, has_first, has_last = pipeline_llama(
+            model=model,
+            parallel_dims=pdims,
+            job_config=job_config,
+            device=pp_device,
+            model_args=titan_args,
+            parallelize_fn=parallelize_llama,
+            loss_fn=create_pp_loss_fn(grad_accum_steps),
+            compression_ratio=compression_ratio,
+        )
+
+        # when PP is enabled, the original monolithic `model` is not used
+        del model
+
+        return MetaModel(
+            model_parts=model_parts,
+            pp_scheduler=pp_scheduler,
+            pp_has_first_stage=has_first,
+            pp_has_last_stage=has_last,
+        )
+
     # Parallelize the model while still on meta device
     model = parallelize_llama(
         model,
@@ -375,7 +445,12 @@ def create_meta_model(
         job_config=job_config,
     )
 
-    return model
+    return MetaModel(
+        model_parts=[model],
+        pp_scheduler=None,
+        pp_has_first_stage=True,
+        pp_has_last_stage=True,
+    )
 
 
 def initialize_torchtitan_model(
@@ -520,7 +595,7 @@ def initialize_weights_inplace(
             model,
             full_sd,
             options=StateDictOptions(
-                full_state_dict=True, broadcast_from_rank0=True, strict=True
+                full_state_dict=True, broadcast_from_rank0=True, strict=False
             ),
         )
         dist_helper.safe_barrier("weight_init", dist_helper.local_rank)
@@ -737,3 +812,71 @@ def convert_titan_to_hf(
         raise ValueError(
             f"Failed to convert TorchTitan model to HuggingFace format: {e}"
         )
+
+
+def create_orthonormal_Uk(
+    embed_dim: int, rank: int, *, device, dtype=torch.float32
+) -> torch.Tensor:
+    g = torch.randn(embed_dim, rank, device=device, dtype=dtype)
+    Q, _ = torch.linalg.qr(g, mode="reduced")
+    return Q[:, :rank].to(dtype=dtype, device=device).contiguous()
+
+
+def build_U_k(dims, *, device, dtype=torch.float32) -> torch.Tensor:
+    d, k = dims
+    g = torch.randn(d, k, device=device, dtype=dtype)
+    Q, _ = torch.linalg.qr(g, mode="reduced")
+    return Q[:, :k].to(dtype=dtype, device=device).contiguous()
+
+
+@torch.no_grad()
+def build_T_fixed(embeddings, model_sample) -> torch.Tensor:
+    # Returns a **plain** contiguous tensor [V, D] on model_sample.device
+    if embeddings is not None:
+        if isinstance(embeddings.weight, DTensor):
+            mesh_grp = dist_helper.get_mesh_group(model_sample)
+            dist.barrier(mesh_grp)
+            full = embeddings.weight.full_tensor().to(model_sample.device)
+            T_fixed = full.detach().clone().contiguous()
+            dist.barrier(mesh_grp)
+            return T_fixed
+        else:
+            # Non-DTensor path: just clone to ensure we own storage
+            W = embeddings.weight.detach().to(model_sample.device)
+            return W.clone().contiguous()
+
+
+def build_and_wire_compression_state(
+    model: torch.nn.Module,
+    pp_scheduler,
+    compression_rate: float,
+    device: torch.device,
+):
+    stage = pp_scheduler._stage
+
+    # Helper parameters
+    m = getattr(model, "module", model)
+    embeddings = getattr(m, "tok_embeddings", None)
+    model_sample = next(m.parameters())
+    D = m.args.dim
+    V = m.args.vocab_size
+    k = max(1, int(D * compression_rate))
+
+    # Build U_k, T_fixed on rank0; empty buffers elsewhere
+    rank = dist_helper.rank
+    if embeddings is not None:
+        T_fixed = build_T_fixed(embeddings, model_sample)
+    else:
+        T_fixed = torch.empty((V, D), dtype=model_sample.dtype, device=device)
+
+    if rank == 0:
+        U_k = build_U_k((D, k), device=device, dtype=model_sample.dtype)
+    else:
+        U_k = torch.empty((D, k), dtype=model_sample.dtype, device=device)
+
+    # Broadcast within the mesh/PP group if available; else world
+    dist_helper.broadcast(U_k, src=0)
+    dist_helper.broadcast(T_fixed, src=0)
+
+    # Wire into the stage (this method will .to(self.device) locally)
+    stage.set_compression_attributes(U_k=U_k, T_fixed=T_fixed, project_embedding=True)

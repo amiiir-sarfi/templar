@@ -27,6 +27,7 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
@@ -35,6 +36,7 @@ import bittensor as bt
 import numpy as np
 import torch
 import uvloop
+from torch import autocast
 from torch.amp.grad_scaler import GradScaler
 from torch.distributed.tensor import DTensor as DT
 
@@ -43,6 +45,7 @@ from neurons import BaseNode, Trainer
 from neurons.base_node import CPU_COUNT
 from tplr import model_factory
 from tplr.distributed import dist_helper
+from tplr.pipeline import PipelineStageProtocolCompression
 
 # GPU optimizations
 torch.manual_seed(42)
@@ -91,10 +94,10 @@ class Miner(BaseNode, Trainer):
             "--project", type=str, default="templar", help="Wandb project."
         )
         parser.add_argument(
-            "--actual-batch-size",
-            type=int,
-            default=None,
-            help="Override the batch size defined in hparams.",
+            "--pp_degree", type=int, default=None, help="Override PP degree."
+        )
+        parser.add_argument(
+            "--dp_degree", type=int, default=None, help="Override DP degree."
         )
         parser.add_argument(
             "--device", type=str, default="cuda", help="Device to use for training"
@@ -160,20 +163,20 @@ class Miner(BaseNode, Trainer):
         # 3) Device selection
         self._setup_device()
 
-        # 4) Mixed precision / GradScaler
-        self._setup_amp()
-
-        # 5) Load hparams
+        # 4) Load hparams
         self._load_hparams()
 
-        # 6) Wallet & BaseNode/Trainer init
+        # 5) Wallet & BaseNode/Trainer init
         self._init_wallet_and_base()
 
-        # 7) Model scaffold 
+        # 6) Model scaffold
         self._init_model_scaffold()
 
-        # 8) Read parallelization degrees
+        # 7) Read parallelization degrees
         self._read_parallelization_degrees()
+
+        # 8) Mixed precision / GradScaler
+        self._setup_amp()
 
         # 9) SparseLoCo optimizer init
         self._init_sparseloco()
@@ -228,18 +231,6 @@ class Miner(BaseNode, Trainer):
             self.device = torch.device(self.config.device)
         tplr.logger.info(f"[Init] device set → {self.device}")
 
-    def _setup_amp(self):
-        """Configure AMP dtype and GradScaler enablement."""
-        self.amp_dtype = (
-            torch.bfloat16 if self.config.amp_dtype == "bf16" else torch.float16
-        )
-        self.scaler = GradScaler(
-            enabled=(self.amp_dtype is torch.float16 and self.device.type == "cuda")
-        )
-        tplr.logger.info(
-            f"[Init] Using {self.config.amp_dtype}. GradScaler enabled: {self.scaler.is_enabled()}"
-        )
-
     def _load_hparams(self):
         """Load hparams and handle optional batch size override."""
         self.config.local = cast(bool, self.config.local)
@@ -251,6 +242,22 @@ class Miner(BaseNode, Trainer):
             )
             self.hparams.batch_size = self.config.actual_batch_size
 
+        # Apply pp_degree and dp_degree overrides if provided
+        tt = getattr(self.hparams, "torchtitan", None)
+        if self.config.pp_degree is not None and tt is not None:
+            if self.is_master:
+                tplr.logger.info(
+                    f"Overriding PP degree: {tt.pp_degree} -> {self.config.pp_degree}"
+                )
+            tt.pp_degree = self.config.pp_degree
+
+        if self.config.dp_degree is not None and tt is not None:
+            if self.is_master:
+                tplr.logger.info(
+                    f"Overriding DP degree: {tt.dp_shard} -> {self.config.dp_degree}"
+                )
+            tt.dp_shard = self.config.dp_degree
+
     def _init_wallet_and_base(self):
         """Initialize Bittensor wallet and parent classes."""
         self.wallet = bt.wallet(config=self.config)
@@ -260,9 +267,14 @@ class Miner(BaseNode, Trainer):
     def _init_model_scaffold(self):
         """Create the model on meta device then allocate empty on target device."""
         # Initialize model on meta device first
-        self.init_model(meta=True)
+        self.init_model(meta=True, pp_device=self.device)
+
+        # Get titan args
+        self.tt_args = model_factory.get_titan_model_args(self.hparams)
+
         # Move model from meta to actual device (allocates memory but no initialization)
-        self.model = self.model.to_empty(device=str(self.device))
+        self.model.to_empty(device=str(self.device))
+
         self.model_initialized = False  # Track if model has actual weights
 
     def _read_parallelization_degrees(self):
@@ -273,6 +285,40 @@ class Miner(BaseNode, Trainer):
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
         self.dp_shard = int(getattr(tt, "dp_shard", 1))
+
+        # get ranks
+        if self.pp_degree > 1:
+            # No DDP with PP>1, enforced in model_factory
+            self.pp_rank = self.rank // self.dp_shard
+            self.dp_rank = self.rank % self.dp_shard
+            self.dp_world_size = self.dp_shard
+        else:
+            self.pp_rank = 0
+            self.dp_rank = self.rank
+            self.dp_world_size = self.dp_shard * self.dp_replicate
+
+        self.pp_compression_ratio = float(getattr(tt, "pp_compression_ratio", 1.0))
+        self.protocol_compression_enabled = (
+            0.0 < self.pp_compression_ratio < 1.0 and self.pp_degree > 1
+        )
+        self.fsdp_enabled = self.dp_shard > 1
+
+    def _setup_amp(self):
+        """Configure AMP dtype and GradScaler enablement."""
+        self.amp_dtype = (
+            torch.bfloat16 if self.config.amp_dtype == "bf16" else torch.float16
+        )
+        self.scaler = GradScaler(
+            enabled=(self.amp_dtype is torch.float16 and self.device.type == "cuda")
+        )
+        self.auto_cast_context = (
+            autocast(device_type=self.device.type, dtype=self.amp_dtype)
+            if self.dp_shard > 1
+            else nullcontext()
+        )
+        tplr.logger.info(
+            f"[Init] Using {self.config.amp_dtype}. GradScaler enabled: {self.scaler.is_enabled()}"
+        )
 
     def _init_sparseloco(self):
         """Prepare compression transformer, compressor, EF CPU buffers, and precompute shapes."""
@@ -297,7 +343,7 @@ class Miner(BaseNode, Trainer):
         model_iterator = self.model.named_parameters()
 
         for idx, (n, p) in enumerate(model_iterator):
-            if idx % self.world_size == self.rank:
+            if idx % self.dp_world_size == self.dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on full tensor since TP is not supported
@@ -397,8 +443,8 @@ class Miner(BaseNode, Trainer):
 
         self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
-            rank=self.local_rank,
-            world_size=self.world_size,
+            rank=self.dp_rank,
+            world_size=self.dp_world_size,
             comms=self.comms,
             token_dtype=np.uint32,  # Match preprocessing script dtype
         )
@@ -456,7 +502,6 @@ class Miner(BaseNode, Trainer):
             ckpt_global_step,
             from_bootstrap,
         ) = await tplr.neurons.load_checkpoint_with_fallback(self)
-
         # If no checkpoint was loaded, initialize model weights now
         if not self.model_initialized:
             tplr.logger.info("No checkpoint loaded, initializing model weights...")
@@ -468,6 +513,12 @@ class Miner(BaseNode, Trainer):
         await tplr.neurons.handle_checkpoint_catchup(
             self, ckpt_ok, ckpt_sync_win, ckpt_global_step, from_bootstrap
         )
+
+        # Set compression PP states if enabled
+        if self.protocol_compression_enabled:
+            model_factory.build_and_wire_compression_state(
+                self.model, self.pp_scheduler, self.pp_compression_ratio, self.device
+            )
 
         self.comms.start_commitment_fetcher()
 
@@ -483,7 +534,7 @@ class Miner(BaseNode, Trainer):
         dist_helper.safe_barrier("dataset_init_complete", self.local_rank)
 
         # All workers need to instantiate dataloader
-        self.set_dataloader()
+        self.set_dataloader()  # TODO: Make this `self.pp_has_first_stage` ONLY
 
         # Track the current shard to avoid double-swapping at initialization
         last_shard = current_shard
@@ -636,7 +687,7 @@ class Miner(BaseNode, Trainer):
                 f"{tplr.P(step_window, compression_time)} "
                 f"Compressed local shard with {len(shard_gradient) - 1} tensors"
             )
-
+            # tplr.logger.info(f"Shard keys: {list(shard_gradient.keys())}")
             # gather the shards → rank-0
             gathered = dist_helper.gather_object(
                 shard_gradient,
@@ -684,7 +735,6 @@ class Miner(BaseNode, Trainer):
                     k: (v.to("cpu") if isinstance(v, torch.Tensor) else v)
                     for k, v in gradient.items()
                 }
-
             else:
                 # non-master ranks simply wait; they don't upload
                 put_time = 0.0
@@ -827,7 +877,10 @@ class Miner(BaseNode, Trainer):
                 debug_dict = {}
 
                 # Add model parameters debug info
-                for name, param in self.model.named_parameters():
+                for (
+                    name,
+                    param,
+                ) in self.model.named_parameters():  # TODO: accept model_parts
                     if param is not None:
                         # Handle DTensor vs regular tensor
                         if isinstance(param, DT):
@@ -997,7 +1050,7 @@ class Miner(BaseNode, Trainer):
     async def cleanup_window(self):
         """Aggressive memory cleanup between windows"""
         # Clear gradients more thoroughly
-        self.model.zero_grad(set_to_none=True)
+        self.model.zero_grad(set_to_none=True)  # TODO: accept model_parts
         self.inner_optimizer.zero_grad(set_to_none=True)
 
         # Clear error feedback for non-owned params to save memory

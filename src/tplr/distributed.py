@@ -72,6 +72,20 @@ class DistributedHelper:
         if self.world_size > 1 and dist.is_initialized():
             dist.destroy_process_group()
 
+    def get_mesh_group(self, x):
+        if not self.is_dtensor(x):
+            return None
+        mesh = getattr(x, "device_mesh", None)
+        if mesh is None:
+            spec = getattr(x, "_spec", None)
+            mesh = getattr(spec, "mesh", None)
+        if mesh is not None:
+            try:
+                return mesh.get_group()
+            except Exception:
+                pass
+        return dist.group.WORLD if self.ddp_initialized() else None
+
     def is_distributed(self) -> bool:
         """Check if distributed training is enabled."""
         return dist.is_available() and dist.is_initialized() and self.world_size > 1
@@ -93,6 +107,9 @@ class DistributedHelper:
         flag_tensor = torch.tensor([int(local_has_batch)], device=device)
         dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
         return bool(flag_tensor.item())
+
+    def ddp_initialized():
+        return dist.is_available() and dist.is_initialized()
 
     def ddp_reduce(
         self,
@@ -130,14 +147,25 @@ class DistributedHelper:
         dist.all_reduce(tensor, op=op)
         return float(tensor.item())
 
-    def barrier(self, device_ids: list | None = None) -> None:
+    def barrier(
+        self, device_ids: list | None = None, *, group: dist.ProcessGroup | None = None
+    ) -> None:
         """
         Synchronization barrier across all ranks.
 
         Args:
             device_ids: Optional device IDs for NCCL backend
+            group: Optional process group to synchronize
         """
         if not self.is_distributed():
+            return
+
+        if group is not None:
+            if device_ids is not None:
+                tplr.logger.warning(
+                    "[barrier] device_ids ignored when group is specified"
+                )
+            dist.barrier(group=group)
             return
 
         if device_ids is not None and dist.get_backend() == "nccl":
@@ -281,6 +309,17 @@ class DistributedHelper:
         if self.is_distributed():
             dist.broadcast(tensor, src=src)
 
+    def broadcast_object_list(self, object_list: list[Any], src: int = 0) -> None:
+        """
+        Broadcast tensor from source rank to all other ranks.
+
+        Args:
+            tensor: Tensor to broadcast (modified in-place)
+            src: Source rank for broadcast
+        """
+        if self.is_distributed():
+            dist.broadcast_object_list(object_list, src=src)
+
     def gather_object(
         self, obj: Any, object_list: list | None = None, dst: int = 0
     ) -> list | None:
@@ -350,6 +389,14 @@ class DistributedHelper:
 
     def _model_device(self, model: torch.nn.Module) -> torch.device:
         return next(model.parameters()).device
+
+    def is_dtensor(self, x):
+        try:
+            from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
+
+            return isinstance(x, DTensor)
+        except Exception:
+            return type(x).__name__ in {"DTensor", "DistributedTensor", "DT"}
 
     def _get_offload_stream(self, model: torch.nn.Module):
         if not torch.cuda.is_available():

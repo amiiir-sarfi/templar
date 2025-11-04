@@ -55,8 +55,6 @@ class SharedShardedDataset(Dataset):
         # Detect DDP context (works in single-process mode too)
         self.rank = rank
         self.world = world_size
-        if self.world > 1:
-            dist.barrier(device_ids=[self.rank])
 
         self.tokens_file, self.ids_file = self.locate_shards(
             shard_index, file_prefix=file_prefix
@@ -208,6 +206,9 @@ class ShardedDatasetManager:
             comms: An instance of `tplr.comms.Comms` for communication.
             token_dtype: The numpy data type of the tokens.
         """
+        tplr.logger.info(
+            f"rank={rank} and world_size={world_size} initializing ShardedDatasetManager"
+        )
         self.sequence_length = sequence_length
         self.rank = rank
         self.world_size = world_size
@@ -239,15 +240,17 @@ class ShardedDatasetManager:
 
         if os.path.exists(tokens_file) and os.path.exists(ids_file):
             # if exist, return completed task
-            print(f"Shard {shard_index} already exists on disk. Loading...")
+            tplr.logger.info(f"Shard {shard_index} already exists on disk. Loading...")
             task = asyncio.create_task(asyncio.sleep(0))
 
         else:
+            tplr.logger.info(
+                f"Shard {shard_index} does not exist on disk. Downloading..."
+            )
             bucket = self.comms.get_own_bucket("dataset", "read")
             task = asyncio.create_task(
                 self.download_files(bucket, tokens_file, ids_file)
             )
-
         return task
 
     async def download_files(

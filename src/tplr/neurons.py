@@ -55,38 +55,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         step_window: Current window number
         null_round: If True, this is a null/warmup round and error feedback should be cleared
     """
-
-    # ------------ helpers ------------
-    def ddp_initialized():
-        return dist.is_available() and dist.is_initialized()
-
-    def is_dtensor(x):
-        try:
-            from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
-
-            return isinstance(x, DTensor)
-        except Exception:
-            return type(x).__name__ in {"DTensor", "DistributedTensor", "DT"}
-
-    def get_mesh_group(x):
-        if not is_dtensor(x):
-            return None
-        mesh = getattr(x, "device_mesh", None)
-        if mesh is None:
-            spec = getattr(x, "_spec", None)
-            mesh = getattr(spec, "mesh", None)
-        if mesh is not None:
-            try:
-                return mesh.get_group()
-            except Exception:
-                pass
-        return dist.group.WORLD if ddp_initialized() else None
-
-    def barrier(group=None):
-        if ddp_initialized() and group is not None:
-            dist.barrier(group=group)
-
-    # ------------ start ------------
     gradient, xshapes, totalks = {}, {}, {}
     lr = float(miner.hparams.outer_learning_rate)
     use_dct = getattr(miner.hparams, "use_dct", False)
@@ -114,17 +82,17 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
     for _, (n, p) in enumerate(model_iterator, 1):
         owned = n in miner.owned_params
-        p_is_dt = is_dtensor(p)
+        p_is_dt = dist_helper.is_dtensor(p)
         g = getattr(p, "grad", None)
-        g_is_dt = is_dtensor(g)
+        g_is_dt = dist_helper.is_dtensor(g)
 
         # --- 1) Grad full_tensor rendezvous (GFULL) ---
         if g_is_dt:
-            grp_g = get_mesh_group(g)
-            barrier(grp_g)
+            grp_g = dist_helper.get_mesh_group(g)
+            dist_helper.barrier(group=grp_g)
             assert g is not None
             grad_full = g.full_tensor().to(p.device)
-            barrier(grp_g)
+            dist_helper.barrier(group=grp_g)
         else:
             if g is None and not p_is_dt:
                 continue

@@ -56,8 +56,6 @@ class Trainer:
             window=self.current_window,
             steps_per_window=self.hparams.inner_steps,
             micro_bs=self.hparams.micro_batch_size,
-            rank=self.rank,
-            world_size=self.world_size,
         )
 
         if validator:
@@ -66,6 +64,8 @@ class Trainer:
                 batch_size=self.hparams.target_batch_size,
                 validation_bs=self.hparams.validator_sample_micro_bs
                 * self.hparams.micro_batch_size,
+                rank=self.rank,
+                world_size=self.world_size,
             )
         else:
             SamplerClass = tplr.MinerSampler
@@ -73,6 +73,8 @@ class Trainer:
                 micro_bs=self.hparams.micro_batch_size,
                 batch_size=self.hparams.batch_size,
                 target_batch_size=self.hparams.target_batch_size,
+                rank=self.dp_rank,
+                world_size=self.dp_world_size,
             )
 
         self.sampler = SamplerClass(**kwargs)
@@ -99,18 +101,26 @@ class Trainer:
 
         return expected_compressed_params
 
-    def init_model(self, validator=False, meta=False):
+    def init_model(self, validator=False, meta=False, pp_device=None):
         role = "miner"
         if validator:
             role = "validator"
 
         if meta:
             # Create model on meta device (no memory allocation)
-            self.model = model_factory.create_meta_model(
+            meta_model = model_factory.create_meta_model(
                 hparams=self.hparams,
                 role=role,
                 world_size=self.world_size,
+                pp_device=pp_device,
             )
+            self.model = meta_model.model_parts[0]
+            # No pp, same route as before
+            if role == "miner":
+                self.pp_scheduler = meta_model.pp_scheduler
+                self.pp_has_first_stage = meta_model.pp_has_first_stage
+                self.pp_has_last_stage = meta_model.pp_has_last_stage
+
         else:
             # Initialize model with actual weights
             self.model = model_factory.initialize_torchtitan_model(
@@ -119,6 +129,8 @@ class Trainer:
                 device=str(self.device),
                 world_size=self.world_size,
             )
+
+        # TODO: Fix: expected compressed params is failing with PP
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
@@ -705,7 +717,14 @@ class Trainer:
         inner_step_count: int = 0
         loader_iter = iter(loader)
 
-        # Wrap the training loop with profiler context (does nothing if prof_ctx is nullcontext)
+        # PP flags
+        pp_enabled = getattr(self, "pp_scheduler", None) is not None
+        has_first = getattr(self, "pp_has_first_stage", False)
+        has_last = getattr(self, "pp_has_last_stage", False)
+
+        corrected_accum_steps = max(getattr(self.sampler, "grad_accum_steps", 1), 1)
+
+        # Training loop
         with prof_ctx:
             while not self.stop_event.is_set():
                 # ------------------------------------------------------------------ #
@@ -761,31 +780,63 @@ class Trainer:
                 # ------------------------------------------------------------------ #
                 # 3. Forward + backward
                 # ------------------------------------------------------------------ #
-                with tp.record_function("Forward Pass") if prof else nullcontext():
-                    with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                        outputs = self.model(input_ids, labels)
+                if not pp_enabled:
+                    with tp.record_function("Forward Pass") if prof else nullcontext():
+                        with self.auto_cast_context:
+                            outputs = self.model(input_ids, labels)
 
-                    calculated_loss = cross_entropy_loss(outputs, labels)
+                        calculated_loss = cross_entropy_loss(outputs, labels)
 
-                    loss = calculated_loss / self.sampler.grad_accum_steps
-                    loss_item = calculated_loss.detach().item()
+                        loss = calculated_loss / self.sampler.grad_accum_steps
+                        loss_item = calculated_loss.detach().item()
 
-                # -------------------------------------------------------------- #
-                # 3-a.  Back-prop with no_sync() on non-final micro-batches
-                # -------------------------------------------------------------- #
-                with tp.record_function("Backward Pass") if prof else nullcontext():
-                    corrected_accum_steps = max(self.sampler.grad_accum_steps, 1)
-                    final_micro_batch = (batch_count + 1) % corrected_accum_steps == 0
-                    if (
-                        hasattr(self.model, "no_sync")
-                        and self.world_size > 1
-                        and not final_micro_batch
+                    # -------------------------------------------------------------- #
+                    # 3-a.  Back-prop with no_sync() on non-final micro-batches
+                    # -------------------------------------------------------------- #
+                    with tp.record_function("Backward Pass") if prof else nullcontext():
+                        final_micro_batch = (
+                            batch_count + 1
+                        ) % corrected_accum_steps == 0
+                        if (
+                            hasattr(self.model, "no_sync")
+                            and self.world_size > 1
+                            and not final_micro_batch
+                        ):
+                            sync_ctx = self.model.no_sync()
+                        else:
+                            sync_ctx = nullcontext()
+                        with sync_ctx:
+                            self.scaler.scale(loss).backward()
+
+                else:
+                    # Pipeline parallel forward/backward
+                    with (
+                        tp.record_function("PP Forward/Backward")
+                        if prof
+                        else nullcontext()
                     ):
-                        sync_ctx = self.model.no_sync()
-                    else:
-                        sync_ctx = nullcontext()
-                    with sync_ctx:
-                        self.scaler.scale(loss).backward()
+                        with self.auto_cast_context:
+                            targets, losses = (
+                                (labels, []) if self.pp_has_last_stage else (None, None)
+                            )
+                            if has_first:
+                                self.pp_scheduler.step(
+                                    input_ids, target=targets, losses=losses
+                                )
+                            else:
+                                self.pp_scheduler.step(target=targets, losses=losses)
+
+                        if has_last:
+                            # Mean loss for metrics (gradients already accumulated by scheduler)
+                            calculated_loss = torch.mean(torch.stack(losses)).to(
+                                self.device
+                            )
+                            # TODO: Fix: PP logging since this loss is now normalized by n_accum_steps inside the scheduler
+                            loss_item = float(calculated_loss.detach().item())
+                        else:
+                            # Non-last stages don't have a loss value
+                            calculated_loss = torch.tensor(0.0, device=self.device)
+                            loss_item = 0.0
 
                 total_loss += loss_item
                 local_loss_sum += loss_item  # defer collective
@@ -796,7 +847,9 @@ class Trainer:
                 # ------------------------------------------------------------------ #
                 # 4. Decide *together* whether to take an optimiser step
                 # ------------------------------------------------------------------ #
+                final_micro_batch = (batch_count % corrected_accum_steps) == 0
                 step_now = final_micro_batch or window_changed
+
                 if self.world_size > 1:
                     # Use MAX to ensure if any rank needs to step, all step
                     from torch.distributed import ReduceOp
@@ -830,15 +883,20 @@ class Trainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                         if not null_round:
-                            # Unscale, clip, then step via GradScaler if using fp16
-                            self.scaler.unscale_(self.inner_optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                            self.scaler.step(self.inner_optimizer)
-                            self.scaler.update()
-                            self.inner_scheduler.step()
+                            if not pp_enabled:
+                                # Unscale, clip, then step via GradScaler if using fp16
+                                self.scaler.unscale_(self.inner_optimizer)
+                                self.scaler.step(self.inner_optimizer)
+                                self.scaler.update()
+                                self.inner_scheduler.step()
+                            else:
+                                # No GradScaler here because backward was done inside PP scheduler
+                                self.inner_optimizer.step()
+                                self.inner_scheduler.step()
                         else:
-                            # Spin-up: don't step optimizer/scheduler, just clear gradients
-                            self.scaler.update()
+                            # Spin-up: don't step optimizer/scheduler, just clear gradients. No scaler with PP
+                            if not pp_enabled:
+                                self.scaler.update()
 
                         self.inner_optimizer.zero_grad(set_to_none=True)
 
@@ -855,8 +913,10 @@ class Trainer:
                             tplr.logger.info(
                                 f"Inner Step {inner_step_count}, "
                                 f"Batch {batch_count}, loss: {log_loss:.4f}, "
-                                f"accum: {accum_batch_size}/{self.hparams.batch_size}"
+                                f"accum: {accum_batch_size}/{self.hparams.batch_size}, "
+                                f"lr: {self.inner_scheduler.get_last_lr()[0]:.2e}"
                             )
+
                         if window_entry_loss == 0.0:
                             total_batches_first_step = int(
                                 dist_helper.ddp_reduce(batch_count, device=self.device)
