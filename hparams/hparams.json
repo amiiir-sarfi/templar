@@ -1,27 +1,27 @@
 {
     "spec_version": 5,
     "project": "dough",
-    "tokenizer_name": "google/gemma-3-270m",
+    "tokenizer_name": "togethercomputer/LLaMA-2-7B-32K",
     "sequence_length": 2048,
-    "micro_batch_size": 1,
-    "target_batch_size": 1024,
-    "batch_size": 192,
-    "inner_steps": 30,
-    "outer_learning_rate": 0.7,
-    "blocks_per_window": 115,
-    "windows_per_weights": 3,
-    "outer_steps_per_shard": 455,
+    "micro_batch_size": 64,
+    "target_batch_size": 128,
+    "batch_size": 128,
+    "inner_steps": 50,
+    "outer_learning_rate": 1,
+    "blocks_per_window": 4,
+    "windows_per_weights": 5,
+    "outer_steps_per_shard": 500, 
     "momentum_decay": 0.95,
-    "topk_compression": 64,
+    "topk_compression": 256,
     "target_chunk": 64,
     "use_dct": false,
     "binary_score_ma_alpha": 0.05,
     "moving_average_window": 5,
     "missing_gradient_penalty_score": -99.0,
-    "model_size": "70B",
+    "model_size": "150M",
     "weight_decay": 0.1,
     "validator_offset": 1,
-    "checkpoint_frequency": 10,
+    "checkpoint_frequency": 10000,
     "gather_peer_count": 20,
     "gather_share": 0.75,
     "gather_top_ratio": 2.0,
@@ -33,17 +33,17 @@
     "active_check_interval": 100,
     "recent_windows": 2,
     "power_normalisation": 2.0,
-    "validator_sample_micro_bs": 8,
+    "validator_sample_micro_bs": 1,
     "gather_peers_slash_threshold": 0.4,
     "uids_per_window": 20,
-    "time_window_delta_seconds": 70,
+    "time_window_delta_seconds": 20,
     "reset_inactivity_windows": 3,
     "sync_max_steps_behind": 3,
-    "eval_lr_factor": 0.2,
+    "eval_lr_factor": 1.0,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": "2.1.9",
-    "checkpoint_init_window": 58181,
+    "checkpoint_init_version": null,
+    "checkpoint_init_window": null,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
@@ -54,13 +54,13 @@
   "optimizer": {
     "type": "adamw",
     "adamw": {
-      "betas": [0.9, 0.95],
+      "betas": [0.9, 0.99],
       "eps": 1e-8,
       "weight_decay": 0.1,
-      "learning_rate": 1.17e-4,
+      "learning_rate": 1e-3,
       "scheduler": {
-        "warmup_steps": 1500,
-        "t_max": 140000,
+        "warmup_steps": 500,
+        "t_max": 7200,
         "eta_min_factor": 0.1
       }
     },
@@ -81,11 +81,11 @@
   "offload_optimizer_states": true,
   "torchtitan": {
     "tp_degree": 1,
-    "pp_degree": 1,
+    "pp_degree": 2,
     "cp_degree": 1,
 
     "dp_replicate": 1,
-    "dp_shard": 8,
+    "dp_shard": 2,
 
     "compile": true,
     "enable_cpu_offload": false,
@@ -100,11 +100,13 @@
 
     "float8_recipe_name": null,
     
-    "tie_embeddings": true,
+    "tie_embeddings": false,
 
     "activation_checkpoint": {
       "mode": "selective",
       "option": "op"
-    }
+    },
+
+    "pp_compression_ratio": 1.0
   }
 }

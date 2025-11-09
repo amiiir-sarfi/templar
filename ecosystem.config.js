@@ -1,4 +1,4 @@
-// ecosystem.config.js
+// ecosystem.config.js -- 3 miners with FSDP=2, 1 miner with single GPU, 1 validator with single GPU
 require('dotenv').config({ path: '.env' });
 
 const { execSync } = require('child_process');
@@ -21,7 +21,7 @@ module.exports = {
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "2",
+        "--nproc_per_node", "4",
         "neurons/miner.py",
         "--wallet.name", "miner1",
         "--wallet.hotkey", "default",
@@ -29,12 +29,14 @@ module.exports = {
         "--subtensor.network", "local",
         "--netuid", "2",
         "--use_wandb",
-        "--project", PROJECT_NAME
+        "--project", PROJECT_NAME,
+        "--pp_degree", "2",
+        "--dp_degree", "2"
       ],
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "1,2"
+        CUDA_VISIBLE_DEVICES: "1,2,3,4"
       }
     },
     {
@@ -53,14 +55,68 @@ module.exports = {
         "--subtensor.network", "local",
         "--netuid", "2",
         "--use_wandb",
-        "--project", PROJECT_NAME
+        "--project", PROJECT_NAME,
+        "--pp_degree", "1",
+        "--dp_degree", "2"
       ],
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "3,4"
+        CUDA_VISIBLE_DEVICES: "5,6"
       }
     },
+    // {
+    //   name            : "TM3",
+    //   exec_mode       : "fork",
+    //   exec_interpreter: "none",
+    //   script          : "torchrun",
+    //   args: [
+    //     "--standalone",
+    //     "--nnodes", "1",
+    //     "--nproc_per_node", "1",
+    //     "neurons/miner.py",
+    //     "--wallet.name", "miner3",
+    //     "--wallet.hotkey", "default",
+    //     "--device", "cuda",
+    //     "--subtensor.network", "local",
+    //     "--netuid", "2",
+    //     "--use_wandb",
+    //     "--project", PROJECT_NAME,
+    //     "--pp_degree", "1",
+    //     "--dp_degree", "1"
+    //   ],
+    //   env: {
+    //     ...process.env,
+    //     PROJECT_NAME,
+    //     CUDA_VISIBLE_DEVICES: "6"
+    //   }
+    // },
+    // {
+    //   name            : "TM4",
+    //   exec_mode       : "fork",
+    //   exec_interpreter: "none",
+    //   script          : "torchrun",
+    //   args: [
+    //     "--standalone",
+    //     "--nnodes", "1",
+    //     "--nproc_per_node", "1",
+    //     "neurons/miner.py",
+    //     "--wallet.name", "miner4",
+    //     "--wallet.hotkey", "default",
+    //     "--device", "cuda",
+    //     "--subtensor.network", "local",
+    //     "--netuid", "2",
+    //     "--use_wandb",
+    //     "--project", PROJECT_NAME,
+    //     "--pp_degree", "1",
+    //     "--dp_degree", "1"
+    //   ],
+    //   env: {
+    //     ...process.env,
+    //     PROJECT_NAME,
+    //     CUDA_VISIBLE_DEVICES: "7"
+    //   }
+    // },
 
     /*──────────────────────── Validator ──────────────────────*/
     {

@@ -23,6 +23,8 @@ evaluator, validator, and miner components.
 
 from dataclasses import dataclass
 from collections import OrderedDict
+import json
+import os
 from logging import config
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -406,8 +408,8 @@ def create_meta_model(
             raise ValueError("pp_device must be provided when pp is enabled.")
 
         dp_degree = pdims.dp_replicate * pdims.dp_shard
-        local_batch = hparams.batch_size // dp_degree
-        grad_accum_steps = local_batch // hparams.micro_batch_size
+        denom = hparams.micro_batch_size * dp_degree
+        grad_accum_steps = hparams.batch_size // denom
 
         def create_pp_loss_fn(grad_accum_steps):
             def pipeline_loss_fn(logits, labels):
@@ -538,7 +540,7 @@ def initialize_torchtitan_model(
             full_sd,
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
-        if missing or unexpected:
+        if missing:
             raise ValueError(f"Missing {missing}, unexpected {unexpected}")
 
     # Log initialization details
@@ -575,8 +577,8 @@ def initialize_weights_inplace(
     titan_args = get_titan_model_args(hparams)
 
     if dist_helper.is_distributed():
+        # 1) Rank 0 builds full reference state (CPU)
         if dist_helper.is_master:
-            # Create reference model on CPU for weight initialization
             with torch.device("meta"):
                 ref = TitanLlama(titan_args)
                 ref.args = titan_args
@@ -588,18 +590,27 @@ def initialize_weights_inplace(
                 ref, options=StateDictOptions(full_state_dict=True)
             )
         else:
-            full_sd = {}
+            full_sd = None  # placeholder
 
-        # Broadcast and set weights
-        set_model_state_dict(
+        # 2) Broadcast the **entire** dict to all ranks
+        obj_list = [full_sd]
+        dist.broadcast_object_list(obj_list, src=0)
+        full_sd = obj_list[0]
+
+        # 4) Load strictly (no internal broadcast; everyone already has the payload)
+        missing, unexpected = set_model_state_dict(
             model,
             full_sd,
             options=StateDictOptions(
-                full_state_dict=True, broadcast_from_rank0=True, strict=False
+                full_state_dict=True, strict=False, broadcast_from_rank0=False
             ),
         )
+        if missing:
+            raise RuntimeError(f"Missing {missing}, unexpected {unexpected}")
+
         dist_helper.safe_barrier("weight_init", dist_helper.local_rank)
-    else:
+
+    else:  # TODO: Fix: Non-distributed path init is not in sync with distributed path
         # Single-process path
         with torch.device("meta"):
             ref = TitanLlama(titan_args)
@@ -616,6 +627,68 @@ def initialize_weights_inplace(
             full_sd,
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
+
+    # local_debug = {}
+
+    # for name, param in model.named_parameters():
+    #     if param is None:
+    #         continue
+    #     if dist_helper.is_dtensor(param):
+    #         local_param = param.to_local()
+    #         if local_param.numel() >= 12:
+    #             local_debug[name + "_debug"] = (
+    #                 local_param.flatten()[10:12].detach().cpu().tolist()
+    #             )
+    #     else:
+    #         if param.numel() >= 12:
+    #             local_debug[name + "_debug"] = (
+    #                 param.flatten()[10:12].detach().cpu().tolist()
+    #             )
+
+    # # Gather these tiny dicts to master and merge so rank-0 uploads a complete view
+    # gathered_dbg = dist_helper.gather_object(
+    #     local_debug,
+    #     object_list=[None] * dist_helper.world_size if dist_helper.is_master else None,
+    #     dst=0,
+    # )
+
+    # if dist_helper.is_master:
+    #     debug_dict = {}
+
+    #     # Merge param slices from all PP stages so ALL layers are represented
+    #     if gathered_dbg is not None:
+    #         for d in gathered_dbg:
+    #             if d:
+    #                 debug_dict.update(d)
+
+    #     # Get PP and DP_shard values from hparams
+    #     tt = getattr(hparams, "torchtitan", SimpleNamespace())
+    #     pp_degree = int(getattr(tt, "pp_degree", 1))
+    #     dp_shard = int(getattr(tt, "dp_shard", 1))
+
+    #     # Create debug_dicts directory if it doesn't exist
+    #     debug_dir = "/root/templar/debug_dicts"
+    #     os.makedirs(debug_dir, exist_ok=True)
+
+    #     # Save debug dictionary as JSON file
+    #     filename = f"pp_{pp_degree}_dp_{dp_shard}.json"
+    #     filepath = os.path.join(debug_dir, filename)
+    #     with open(filepath, 'w') as f:
+    #         json.dump(debug_dict, f, indent=2, default=str)
+    #     tplr.logger.info(f"Saved debug dictionary to {filepath}")
+
+    # # Debug: Print first 2 values of wk layers from each rank
+    # rank = dist.get_rank() if dist.is_initialized() else 0
+    # for name, param in model.named_parameters():
+    #     if 'wk' in name:
+    #         if isinstance(param, DTensor):
+    #             local_tensor = param.to_local()
+    #             vals = local_tensor.flatten()[:2].tolist()
+    #         else:
+    #             vals = param.flatten()[:2].tolist()
+    #         print(f"[{rank}] {name}: {vals[0] if len(vals) > 0 else 'N/A'}, {vals[1] if len(vals) > 1 else 'N/A'}")
+
+    # import sys; sys.exit()
 
 
 def _get_unwrapped_model(model: nn.Module) -> "TitanLlama":

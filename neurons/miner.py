@@ -291,7 +291,7 @@ class Miner(BaseNode, Trainer):
             # No DDP with PP>1, enforced in model_factory
             self.pp_rank = self.rank // self.dp_shard
             self.dp_rank = self.rank % self.dp_shard
-            self.dp_world_size = self.dp_shard
+            self.dp_world_size = self.dp_shard * self.dp_replicate
         else:
             self.pp_rank = 0
             self.dp_rank = self.rank
@@ -321,8 +321,8 @@ class Miner(BaseNode, Trainer):
         )
 
     def _init_sparseloco(self):
-        """Prepare compression transformer, compressor, EF CPU buffers, and precompute shapes."""
-        # Compression components
+        """Prepare compression transformer, compressor, EF CPU buffers, and precompute shapes (PP-safe)."""
+        # 1) Compression components
         self.transformer = tplr.compress.ChunkingTransformer(
             self.model, target_chunk=self.hparams.target_chunk
         )
@@ -333,18 +333,19 @@ class Miner(BaseNode, Trainer):
         )
         tplr.logger.info("[Init] compression pipeline ready")
 
-        # Error feedback buffers + compression shapes
+        # 2) Error feedback buffers + own params
         self.error_feedback = {}
         self.error_feedback_cpu_buffers = {}
         self.owned_params = set()
 
-        self.xshapes = {}
-        self.totalks = {}
-        model_iterator = self.model.named_parameters()
+        # 3) Local compression metadata (PP safe)
+        self.xshapes: dict[str, tuple] = {}
+        self.totalks: dict[str, int] = {}
 
+        model_iterator = self.model.named_parameters()
         for idx, (n, p) in enumerate(model_iterator):
             if idx % self.dp_world_size == self.dp_rank:
-                # this rank "owns" the parameter
+                # This rank "owns" the parameter
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on full tensor since TP is not supported
                 self.error_feedback[n] = None
@@ -357,15 +358,32 @@ class Miner(BaseNode, Trainer):
                 use_dct=self.hparams.use_dct,
             )
             _, _, xshape, totalk, _ = self.compressor.compress(
-                enc,
-                self.hparams.topk_compression,
+                enc, self.hparams.topk_compression
             )
             self.xshapes[n] = xshape
             self.totalks[n] = totalk
+            del enc  # free temp
 
         tplr.logger.info(
             f"[Init] Compression initialized for {len(self.xshapes)} parameters"
         )
+
+        # 4) Build global totalks for validation:
+        #    - If PP, all-gather to union across stages.
+        #    - Otherwise, local totalks already represent the full model.
+        if dist_helper.is_distributed() and self.pp_degree > 1:
+            payload = {"totalks": self.totalks}
+            gathered = dist_helper.all_gather_object(payload, object_list=None)
+            self.totalks_global: dict[str, int] = {}
+            for item in gathered:
+                if not item:
+                    continue
+                for pname, tk in item.get("totalks", {}).items():
+                    # All ranks compute the same compressor-domain totalk for a given param name.
+                    self.totalks_global[pname] = int(tk)
+        else:
+            # No PP or not distributed → local covers full model
+            self.totalks_global = dict(self.totalks)
 
     def _init_comms_and_chain_state(self):
         """Initialize communications, verify registration, checkpointing, bucket, and chain state."""
@@ -501,7 +519,9 @@ class Miner(BaseNode, Trainer):
             ckpt_sync_win,
             ckpt_global_step,
             from_bootstrap,
-        ) = await tplr.neurons.load_checkpoint_with_fallback(self)
+        ) = await tplr.neurons.load_checkpoint_with_fallback(
+            self
+        )  # TODO: Fix this with PP
         # If no checkpoint was loaded, initialize model weights now
         if not self.model_initialized:
             tplr.logger.info("No checkpoint loaded, initializing model weights...")
@@ -819,7 +839,7 @@ class Miner(BaseNode, Trainer):
                     device=str(self.device),
                     local=False,
                     stale_retention=100,
-                    totalks=self.totalks,
+                    totalks=self.totalks_global,
                     compressor=self.compressor,
                     time_min=time_min,
                     time_max=time_max,
@@ -838,11 +858,7 @@ class Miner(BaseNode, Trainer):
             self.total_tokens_processed += window_tokens
             tokens_per_sec = window_tokens / training_time if training_time else 0.0
 
-            # ---------------------------------------------------------------------
-            # 6. Await both gather
-            # ---------------------------------------------------------------------
-
-            # 8. Apply gathered gradients
+            # 6. Apply gathered gradients
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             update_start = tplr.T()
@@ -872,41 +888,50 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
+            local_debug = {}
+
+            for name, param in self.model.named_parameters():
+                if param is None:
+                    continue
+                if isinstance(param, DT):
+                    local_param = param.to_local()
+                    if local_param.numel() >= 12:
+                        local_debug[name + "_debug"] = (
+                            local_param.flatten()[10:12].detach().cpu().tolist()
+                        )
+                else:
+                    if param.numel() >= 12:
+                        local_debug[name + "_debug"] = (
+                            param.flatten()[10:12].detach().cpu().tolist()
+                        )
+
+            # Gather these tiny dicts to master and merge so rank-0 uploads a complete view
+            gathered_dbg = dist_helper.gather_object(
+                local_debug,
+                object_list=[None] * self.world_size if self.is_master else None,
+                dst=0,
+            )
+
             if self.is_master:
-                # Add debug data including successfully gathered peers
                 debug_dict = {}
 
-                # Add model parameters debug info
-                for (
-                    name,
-                    param,
-                ) in self.model.named_parameters():  # TODO: accept model_parts
-                    if param is not None:
-                        # Handle DTensor vs regular tensor
-                        if isinstance(param, DT):
-                            local_param = param.to_local()
-                            if local_param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    local_param.flatten()[10:12].detach().cpu().tolist()
-                                )
-                        else:
-                            if param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    param.flatten()[10:12].detach().cpu().tolist()
-                                )
+                # Merge param slices from all PP stages so ALL layers are represented
+                if gathered_dbg is not None:
+                    for d in gathered_dbg:
+                        if d:
+                            debug_dict.update(d)
 
-                # Add gradient fingerprint if available
+                # Include gradient fingerprint if available (unchanged)
                 if gradient_fingerprint is not None:
                     debug_dict["gradient_fingerprint"] = {
                         "global_l2_norm": gradient_fingerprint["global_l2_norm"],
                         "total_elements": gradient_fingerprint["total_elements"],
-                        # Store only first 5 param norms to avoid bloat
                         "sample_param_norms": dict(
                             list(gradient_fingerprint["param_norms"].items())[:5]
                         ),
                     }
 
-                # Add successful peers information
+                # Add peer-success info (unchanged)
                 if gather_result is not None:
                     debug_dict["successful_peers"] = sorted(
                         list(set(self.comms.peers) - set(gather_result.skipped_uids))
@@ -915,7 +940,7 @@ class Miner(BaseNode, Trainer):
                         list(gather_result.skipped_uids)
                     )
 
-                # Store the debug dictionary
+                # Upload the unified debug dictionary
                 await self.comms.put(
                     state_dict=debug_dict,
                     uid=str(self.uid),

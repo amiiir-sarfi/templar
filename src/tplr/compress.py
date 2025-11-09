@@ -639,6 +639,7 @@ class TopKCompressor(Generic[Q]):
             lookup = (
                 lookup.to(val.device) if isinstance(lookup, torch.Tensor) else lookup
             )
+            shift = shift.to(val.device) if isinstance(shift, torch.Tensor) else shift
             deq = lookup[val.long()] + shift
             val = deq.to(orig_dtype)
         return val

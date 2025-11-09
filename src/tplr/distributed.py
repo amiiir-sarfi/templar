@@ -86,6 +86,17 @@ class DistributedHelper:
                 pass
         return dist.group.WORLD if self.ddp_initialized() else None
 
+    def group_leader_rank(self, group) -> int:
+        """Return global-rank of the leader of a given ProcessGroup."""
+        if group is None:
+            return 0
+        try:
+            # PyTorch 2.x+ provides get_global_rank
+            return dist.get_global_rank(group, 0)  # type: ignore[attr-defined]
+        except Exception:
+            # Last resort: assume 0 (safe for single group or if world group is the mesh)
+            return 0
+
     def is_distributed(self) -> bool:
         """Check if distributed training is enabled."""
         return dist.is_available() and dist.is_initialized() and self.world_size > 1

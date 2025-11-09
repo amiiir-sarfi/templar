@@ -87,19 +87,42 @@ class Trainer:
         tplr.logger.info("[Run] dataset + sampler ready")
         return
 
-    def get_expected_params(self) -> set[str]:
+    def _get_local_expected_params(self) -> set[str]:
         """
-        Creates a set of expected names for validation
+        Creates a set of expected names for validation: local for PP, global otherwise.
 
             Returns: The names of all expected keys from a miner
         """
-        expected_compressed_params = set()
-        for param_name, _ in self.model.named_parameters():
-            expected_compressed_params.add(param_name + "idxs")
-            expected_compressed_params.add(param_name + "vals")
-            expected_compressed_params.add(param_name + "quant_params")
+        expected: set[str] = set()
+        for name, _ in self.model.named_parameters():
+            expected.add(name + "idxs")
+            expected.add(name + "vals")
+            expected.add(name + "quant_params")
+        return expected
 
-        return expected_compressed_params
+    def get_expected_params(self) -> None:
+        """
+        PP-safe: all-gather local expected sets, union them on every rank,
+        and publish the *global* expected_compressed_params.
+        (No totalks here — miner computes those from the compressor.)
+        """
+        local_expected = self._get_local_expected_params()
+        payload = {"expected": list(local_expected)}
+
+        if dist_helper.is_distributed():
+            gathered = dist_helper.all_gather_object(payload, object_list=None)
+        else:
+            gathered = [payload]
+
+        global_expected: set[str] = set()
+        for item in gathered:
+            if not item:
+                continue
+            for k in item.get("expected", []):
+                global_expected.add(k)
+
+        # Source of truth for validation everywhere:
+        return global_expected
 
     def init_model(self, validator=False, meta=False, pp_device=None):
         role = "miner"
@@ -130,7 +153,6 @@ class Trainer:
                 world_size=self.world_size,
             )
 
-        # TODO: Fix: expected compressed params is failing with PP
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
@@ -764,7 +786,9 @@ class Trainer:
                         )
 
                     local_bs = len(batch)  # type: ignore
-                    accum_batch_size += local_bs
+                    # Only accumulate batch size on last stage (or all stages if no PP)
+                    if not pp_enabled or has_last:
+                        accum_batch_size += local_bs
 
                     tokens_this_batch = input_ids.numel()
                     batch_tokens += tokens_this_batch
@@ -828,10 +852,11 @@ class Trainer:
 
                         if has_last:
                             # Mean loss for metrics (gradients already accumulated by scheduler)
-                            calculated_loss = torch.mean(torch.stack(losses)).to(
-                                self.device
+                            # Loss is already scaled in PP-scheduler, rescale here to get true loss
+                            calculated_loss = (
+                                torch.stack(losses).mean()
+                                * self.sampler.grad_accum_steps
                             )
-                            # TODO: Fix: PP logging since this loss is now normalized by n_accum_steps inside the scheduler
                             loss_item = float(calculated_loss.detach().item())
                         else:
                             # Non-last stages don't have a loss value
@@ -878,8 +903,10 @@ class Trainer:
                         from torch.distributed import ReduceOp
 
                         log_loss = dist_helper.ddp_reduce(
-                            loss_item, op=ReduceOp.AVG, device=self.device
+                            loss_item, op=ReduceOp.SUM, device=self.device
                         )
+                        # average loss over dp_ws for PP safety
+                        log_loss = log_loss / self.dp_world_size
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                         if not null_round:

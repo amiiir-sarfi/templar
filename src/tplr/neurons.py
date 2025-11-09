@@ -217,16 +217,13 @@ def outer_step(
       Fingerprint dict containing gradient statistics (master rank only), or None.
     """
     model.train()
-
-    # Free any existing grads entirely (do not allocate zeros)
     optimizer.zero_grad(set_to_none=True)
 
-    ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
+    distributed = dist_helper.is_distributed()
     src_rank = 0
-    on_src = is_master or not ddp
+    on_src = is_master or not distributed
 
-    # Only master reads aggregated payload (others rely on broadcasts).
-    # Accept both SimpleNamespace and plain dict payloads.
+    # ---- 1) Build global compressed payload on rank-0, then broadcast it once ----
     src_sd: dict | None = None
     if (
         on_src
@@ -236,26 +233,35 @@ def outer_step(
         sd = gather_result.state_dict
         src_sd = vars(sd).copy() if isinstance(sd, SimpleNamespace) else dict(sd)
 
-    # compact flag broadcast
-    def _bcast_flag(v: int) -> int:
-        t = torch.tensor([v], device=device, dtype=torch.int32)
-        if ddp:
-            dist.broadcast(t, src_rank)
-        return int(t.item())
+    if distributed:
+        box = [src_sd] if on_src else [None]
+        dist_helper.broadcast_object_list(box, src=src_rank)
+        src_sd = box[0] if box[0] is not None else None
+        if src_sd is None:
+            tplr.logger.warning(
+                "[outer_step] Received empty state_dict from gather; skipping step"
+            )
 
-    # optional stats
-    min_median_norm = float("inf")
-    max_median_norm = float("-inf")
+    # If nothing gathered this window, we can't step
+    if src_sd is None:
+        optimizer.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
 
-    # Initialize fingerprint accumulator (master rank only)
-    fingerprint: dict | None = None
-    if on_src:
-        fingerprint = {
-            "param_norms": {},
-            "param_means": {},
-            "total_norm_sq": 0.0,
-            "total_elements": 0,
-        }
+    # ---- helpers ----
+    def _param_mesh_and_leader_global(param: torch.Tensor):
+        """
+        Returns:
+          grp: ProcessGroup for the param's mesh (or None if not DTensor)
+          leader_global: global rank corresponding to *group-rank 0* within that mesh
+        """
+        if dist_helper.is_dtensor(param):
+            grp = dist_helper.get_mesh_group(param)
+            # Global rank for group-rank 0 inside this mesh
+            leader_global = dist_helper.group_leader_rank(grp)
+            return grp, leader_global
+        return None, None
 
     def _idx_to_device(obj, dev: str):
         """
@@ -275,58 +281,80 @@ def outer_step(
             return tuple(_idx_to_device(x, dev) for x in obj)
         return obj
 
+    # optional stats (master only, as in your original)
+    min_median_norm = float("inf")
+    max_median_norm = float("-inf")
+    fingerprint: dict | None = None
+    if on_src:
+        fingerprint = {
+            "param_norms": {},
+            "param_means": {},
+            "total_norm_sq": 0.0,
+            "total_elements": 0,
+        }
+
+    # ---- 2) Iterate only local parameters (PP-safe) ----
     for name, p in model.named_parameters():
-        # ---- master decides if this param has an update; others receive a flag ----
-        has_update = 0
-        payload = None
-
-        if on_src and src_sd is not None:
-            idxs = src_sd.get(name + "idxs")
-            vals = src_sd.get(name + "vals")
-            qps = src_sd.get(name + "quant_params")
-
-            if idxs is not None and vals is not None:
-                if not isinstance(idxs, (list, tuple)):
-                    idxs = [idxs]
-                if not isinstance(vals, (list, tuple)):
-                    vals = [vals]
-                # Dequantize values directly on target device (H2D per-block if needed)
-                vals_f32 = compressor.maybe_dequantize_values(vals, qps, device)
-                if vals_f32:
-                    # Ensure indices (or packed tuples) live on the same device as 'ref'
-                    idxs_dev = _idx_to_device(idxs, device)
-                    payload = (idxs_dev, vals_f32)
-                    has_update = 1
-
-        flag_result = _bcast_flag(has_update)
-        if flag_result == 0:
-            # Nothing to apply for this param
+        # Look up compressed pieces for this param in the broadcasted payload
+        idxs = src_sd.get(name + "idxs")
+        vals = src_sd.get(name + "vals")
+        qps = src_sd.get(name + "quant_params")
+        if idxs is None or vals is None:
+            # No update for this param this window
             continue
 
-        full_grad_src = torch.empty(1)
-        decompressed = None
-        block_norms = None
+        # ensure we also have shape metadata; skip if missing
+        xs = xshapes.get(name)
+        tk = totalks.get(name)
+        if xs is None or tk is None:
+            # This can happen if this rank didn't own the param during compress.
+            # We only apply where we can properly decompress.
+            continue
 
-        # ------- build the full dense grad on the source rank only -------
-        if on_src:
+        # Normalize container types
+        if not isinstance(idxs, (list, tuple)):
+            idxs = [idxs]
+        if not isinstance(vals, (list, tuple)):
+            vals = [vals]
+
+        # --- Leader decision for DTensor params ---
+        grp, mesh_leader = _param_mesh_and_leader_global(p)
+        on_mesh_leader = (
+            distributed
+            and (mesh_leader is not None)
+            and (dist.get_rank() == mesh_leader)
+        )
+
+        # Build dense grad:
+        #   • DTensor → only on the mesh leader (global rank of mesh group-rank 0)
+        #   • non-DTensor → locally
+        build_dense_here = on_mesh_leader or (not dist_helper.is_dtensor(p))
+
+        full_grad_src = None
+        if build_dense_here:
+            vals_f32 = compressor.maybe_dequantize_values(vals, qps, device)
+            if not vals_f32:
+                continue
+            idxs_dev = _idx_to_device(idxs, device)
+
+            decompressed = None
+            block_norms = None
+            ref = None
             try:
-                idxs_dev, vals_f32 = payload  # type: ignore[misc]
-                # Per-block norms for stats/optional clipping inside batch_decompress
                 block_norms = torch.stack([torch.norm(v, p=2) for v in vals_f32])
 
-                # stats
+                # stats (master only)
                 med = float(torch.median(block_norms).item())
                 min_median_norm = min(min_median_norm, med)
                 max_median_norm = max(max_median_norm, med)
 
-                # Use empty_like to avoid copying the param; just provide dtype/device/shape
                 ref = torch.empty_like(p, device=device, dtype=p.dtype)
                 decompressed = compressor.batch_decompress(
                     ref,
                     idxs_dev,
                     vals_f32,
-                    xshapes[name],
-                    totalks[name],
+                    xs,
+                    tk,
                     quantize_params=None,
                     block_norms=block_norms,
                     normalise=False,
@@ -339,7 +367,7 @@ def outer_step(
                     dtype=p.dtype, device=p.device, non_blocking=True
                 )
 
-                # Accumulate fingerprint statistics for this parameter
+                # Accumulate fingerprint statistics (master only)
                 if fingerprint is not None:
                     param_norm = torch.norm(full_grad_src, p=2).item()
                     fingerprint["param_norms"][name] = param_norm
@@ -347,37 +375,38 @@ def outer_step(
                     fingerprint["total_elements"] += full_grad_src.numel()
                     fingerprint["param_means"][name] = full_grad_src.mean().item()
             finally:
-                # Free intermediate pieces ASAP (existence-guarded)
-                try:
+                # aggressively free temporaries
+                del idxs_dev, vals_f32
+                if decompressed is not None:
                     del decompressed
-                except UnboundLocalError:
-                    pass
-                # vals/idxs/qps live in src_sd; only local views should be dropped
-                try:
-                    del vals_f32, idxs_dev, block_norms, ref
-                except UnboundLocalError:
-                    pass
+                if block_norms is not None:
+                    del block_norms
+                if ref is not None:
+                    del ref
 
-        # ------- distribute/broadcast directly into p.grad, step, then free -------
+        # ---- 3) Apply grads to p.grad, step, then free ----
         if isinstance(p, DT):
-            # DTensor param: scatter shards from master
+            # DTensor param: scatter within *param mesh* using mesh group-rank 0 as source
+            assert mesh_leader is not None, "DTensor param without a valid mesh leader"
+
             src_tensor = (
                 full_grad_src
-                if on_src
+                if on_mesh_leader
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,
                 placements=p.placements,
-                src_data_rank=src_rank,
+                src_data_rank=0,  # group-rank 0 inside this param's mesh
             )
-            # master no longer needs the full dense grad
-            if on_src:
+
+            # mesh leader can free its full dense grad
+            if on_mesh_leader and full_grad_src is not None:
                 del full_grad_src
                 full_grad_src = None
 
-            # quick sanity (view, no extra big alloc)
+            # quick sanity (view only, no extra big alloc)
             local_view = new_grad.to_local()
             if not torch.isfinite(local_view).all():
                 del new_grad, local_view
@@ -389,29 +418,18 @@ def outer_step(
             del new_grad, local_view
 
         else:
-            # Replicated param: broadcast dense grad once.
-            if ddp:
-                if on_src:
-                    # Broadcast from the source tensor; then reuse it as grad
-                    dist.broadcast(full_grad_src, src_rank)  # type: ignore[arg-type]
-                    p.grad = full_grad_src
-                    full_grad_src = None
-                else:
-                    # Receive directly into p.grad to avoid an extra buffer
-                    p.grad = torch.empty_like(p, device=p.device, dtype=p.dtype)
-                    dist.broadcast(p.grad, src_rank)  # type: ignore[arg-type]
-            else:
-                # Single process: just use the built tensor
-                p.grad = full_grad_src
-                full_grad_src = None
-
-            if p.grad is not None and not torch.isfinite(p.grad).all():  # type: ignore[arg-type]
-                p.grad = None
+            # Non-DTensor param: local-only apply (typical under PP)
+            if full_grad_src is None:
+                # Nothing to apply here (param owned elsewhere)
+                continue
+            if not torch.isfinite(full_grad_src).all():
+                del full_grad_src
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
+            p.grad = full_grad_src
+            full_grad_src = None
 
-        # ---- apply update immediately for THIS param and free its grad ----
         # ---- apply update immediately for THIS param and free its grad ----
         optimizer.step()
         p.grad = None  # free grad storage right away
@@ -639,7 +657,7 @@ async def load_checkpoint_with_fallback(
     return ckpt_ok, ckpt_sync_win, ckpt_global_step, from_bootstrap
 
 
-async def handle_checkpoint_catchup(
+async def handle_checkpoint_catchup(  # TODO: Fix checkpoint catchup with PP
     instance: NeuronT,
     ckpt_ok: bool,
     ckpt_sync_win: int,
@@ -661,13 +679,13 @@ async def handle_checkpoint_catchup(
     # Decide catch-up windows and run catch-up on ALL ranks
     # When loading from bootstrap, we always need to catch up from start_window
     # to ensure we're using current version's gradients
-    if not ckpt_ok:
+    if not ckpt_ok and False:
         # No checkpoint found, catch up from start_window
         tplr.logger.info("No checkpoint found, will catch up from start_window")
         await catchup_with_aggregation_server(
             instance, instance.start_window, aggregator_device=aggregator_device
         )
-    elif from_bootstrap:
+    elif from_bootstrap and False:
         # Loading from bootstrap, catch up from start_window with current version gradients
         tplr.logger.info(
             f"Loaded bootstrap checkpoint, catching up from start_window "
@@ -676,7 +694,7 @@ async def handle_checkpoint_catchup(
         await catchup_with_aggregation_server(
             instance, instance.start_window, aggregator_device=aggregator_device
         )
-    elif ckpt_sync_win < instance.current_window:
+    elif ckpt_sync_win < instance.current_window and False:
         # Current version checkpoint is behind, catch up from checkpoint window
         catch_up_start = max(ckpt_sync_win, instance.start_window)
         tplr.logger.info(
