@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 import numpy as np
 
+
 def main():
     root = Path("/root/datasets/dclm_tokenized")
     for npy in sorted(root.glob("train_*.npy")):
@@ -17,11 +18,13 @@ def main():
         total = arr.size
         n = total // 2048  # one entry per 2048 elements
 
-        zeros = np.zeros(n, dtype=np.int32)
+        zeros = np.arange(n, dtype=np.int32)
         zeros.tofile(out_path)
 
         rem = total % 2048
         print(f"Wrote {out_path.name}: {n} zeros (from {total} elems, {rem} leftover).")
         # break
+
+
 if __name__ == "__main__":
     main()

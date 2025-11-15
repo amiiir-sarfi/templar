@@ -84,7 +84,7 @@ class DistributedHelper:
                 return mesh.get_group()
             except Exception:
                 pass
-        return dist.group.WORLD if self.ddp_initialized() else None
+        return dist.group.WORLD if self.is_distributed() else None
 
     def group_leader_rank(self, group) -> int:
         """Return global-rank of the leader of a given ProcessGroup."""
@@ -96,6 +96,19 @@ class DistributedHelper:
         except Exception:
             # Last resort: assume 0 (safe for single group or if world group is the mesh)
             return 0
+
+    def get_mesh_leader(self, param: torch.Tensor):
+        """
+        Returns:
+          grp: ProcessGroup for the param's mesh (or None if not DTensor)
+          leader_global: global rank corresponding to *group-rank 0* within that mesh
+        """
+        if self.is_dtensor(param):
+            grp = self.get_mesh_group(param)
+            # Global rank for group-rank 0 inside this mesh
+            leader_global = self.group_leader_rank(grp)
+            return leader_global
+        return None
 
     def is_distributed(self) -> bool:
         """Check if distributed training is enabled."""
@@ -118,9 +131,6 @@ class DistributedHelper:
         flag_tensor = torch.tensor([int(local_has_batch)], device=device)
         dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
         return bool(flag_tensor.item())
-
-    def ddp_initialized():
-        return dist.is_available() and dist.is_initialized()
 
     def ddp_reduce(
         self,

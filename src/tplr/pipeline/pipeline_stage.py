@@ -83,29 +83,34 @@ class PipelineStageProtocolCompression(PipelineStage):
 
     def set_compression_attributes(
         self,
-        U_k: torch.Tensor,
+        U_k: torch.Tensor | None,
         T_fixed: torch.Tensor,
         *,
         project_embedding: bool = True,
     ) -> None:
         """Late-bind compression tensors (must be called after weights exist)."""
         # shape sanity
-        if U_k.dim() != 2:
+        if self.U_k is None and U_k is None:
+            raise ValueError("Given U_k can only be None if self.U_k is already set.")
+        if U_k is not None and U_k.dim() != 2:
             raise ValueError(f"U_k must be 2D [D,k], got {tuple(U_k.shape)}")
         if T_fixed.dim() != 2:
             raise ValueError(f"T_fixed must be 2D [V,D], got {tuple(T_fixed.shape)}")
 
         # Non-DTensor path: place on this stage's device
-        self.U_k = U_k.to(self.device)
+        if U_k is not None:
+            self.U_k = U_k.to(self.device)
+            
         self.T_fixed = T_fixed.to(self.device)
 
         self._compression_ready = True
 
         # One-time projection on first stage
-        m = getattr(self.submod, "module", self.submod)
-        embed = getattr(m, "tok_embeddings", None)
-        if project_embedding and self.is_first and embed is not None:
-            project_embeddings_rowwise_inplace(embed, self.U_k)
+        if project_embedding and self.is_first:
+            m = getattr(self.submod, "module", self.submod)
+            embed = getattr(m, "tok_embeddings", None)
+            if embed is not None and isinstance(embed, nn.Embedding):
+                project_embeddings_rowwise_inplace(embed, self.U_k)
 
     # ---- Protocol compression (rowwise) ----
     def _compress(self, X: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:

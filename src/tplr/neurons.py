@@ -249,20 +249,6 @@ def outer_step(
             torch.cuda.empty_cache()
         return None
 
-    # ---- helpers ----
-    def _param_mesh_and_leader_global(param: torch.Tensor):
-        """
-        Returns:
-          grp: ProcessGroup for the param's mesh (or None if not DTensor)
-          leader_global: global rank corresponding to *group-rank 0* within that mesh
-        """
-        if dist_helper.is_dtensor(param):
-            grp = dist_helper.get_mesh_group(param)
-            # Global rank for group-rank 0 inside this mesh
-            leader_global = dist_helper.group_leader_rank(grp)
-            return grp, leader_global
-        return None, None
-
     def _idx_to_device(obj, dev: str):
         """
         Move indices to device, supporting:
@@ -318,7 +304,7 @@ def outer_step(
             vals = [vals]
 
         # --- Leader decision for DTensor params ---
-        grp, mesh_leader = _param_mesh_and_leader_global(p)
+        mesh_leader = dist_helper.get_mesh_leader(p)
         on_mesh_leader = (
             distributed
             and (mesh_leader is not None)

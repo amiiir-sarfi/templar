@@ -744,7 +744,10 @@ class Trainer:
         has_first = getattr(self, "pp_has_first_stage", False)
         has_last = getattr(self, "pp_has_last_stage", False)
 
-        corrected_accum_steps = max(getattr(self.sampler, "grad_accum_steps", 1), 1)
+        _accum_denom = self.hparams.micro_batch_size * self.dp_world_size
+        grad_accum_steps = self.hparams.batch_size // _accum_denom
+
+        corrected_accum_steps = max(grad_accum_steps, 1)
 
         # Training loop
         with prof_ctx:
@@ -790,9 +793,9 @@ class Trainer:
                     if not pp_enabled or has_last:
                         accum_batch_size += local_bs
 
-                    tokens_this_batch = input_ids.numel()
-                    batch_tokens += tokens_this_batch
-                    local_tokens_sum += tokens_this_batch
+                        tokens_this_batch = input_ids.numel()
+                        batch_tokens += tokens_this_batch
+                        local_tokens_sum += tokens_this_batch
 
                     labels = input_ids.clone()
                     labels[:, :-1] = input_ids[:, 1:]  # ✓ shift by +1
@@ -811,7 +814,7 @@ class Trainer:
 
                         calculated_loss = cross_entropy_loss(outputs, labels)
 
-                        loss = calculated_loss / self.sampler.grad_accum_steps
+                        loss = calculated_loss / grad_accum_steps
                         loss_item = calculated_loss.detach().item()
 
                     # -------------------------------------------------------------- #
@@ -854,8 +857,7 @@ class Trainer:
                             # Mean loss for metrics (gradients already accumulated by scheduler)
                             # Loss is already scaled in PP-scheduler, rescale here to get true loss
                             calculated_loss = (
-                                torch.stack(losses).mean()
-                                * self.sampler.grad_accum_steps
+                                torch.stack(losses).mean() * grad_accum_steps
                             )
                             loss_item = float(calculated_loss.detach().item())
                         else:
@@ -907,17 +909,23 @@ class Trainer:
                         )
                         # average loss over dp_ws for PP safety
                         log_loss = log_loss / self.dp_world_size
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                         if not null_round:
                             if not pp_enabled:
                                 # Unscale, clip, then step via GradScaler if using fp16
                                 self.scaler.unscale_(self.inner_optimizer)
+                                # Clip must happen after unscale
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(), 1.0
+                                )
                                 self.scaler.step(self.inner_optimizer)
                                 self.scaler.update()
                                 self.inner_scheduler.step()
                             else:
                                 # No GradScaler here because backward was done inside PP scheduler
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(), 1.0
+                                )
                                 self.inner_optimizer.step()
                                 self.inner_scheduler.step()
                         else:
@@ -945,8 +953,14 @@ class Trainer:
                             )
 
                         if window_entry_loss == 0.0:
-                            total_batches_first_step = int(
-                                dist_helper.ddp_reduce(batch_count, device=self.device)
+                            # All PP ranks incremented batch_count, so divide by pp_degree
+                            total_batches_first_step = (
+                                int(
+                                    dist_helper.ddp_reduce(
+                                        batch_count, device=self.device
+                                    )
+                                )
+                                / self.pp_degree
                             )
                             window_entry_loss = (
                                 global_loss_sum / total_batches_first_step
@@ -1022,7 +1036,10 @@ class Trainer:
         # ---------------------------------------------------------------------- #
         # 7. Return aggregated metrics
         # ---------------------------------------------------------------------- #
-        batch_count = int(dist_helper.ddp_reduce(batch_count, device=self.device))
+        batch_count = (
+            int(dist_helper.ddp_reduce(batch_count, device=self.device))
+            / self.pp_degree
+        )
         return {
             "total_loss": global_loss_sum,  # cross-rank sum
             "window_entry_loss": window_entry_loss,

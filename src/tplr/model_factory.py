@@ -535,13 +535,11 @@ def initialize_torchtitan_model(
         full_sd = get_model_state_dict(
             ref, options=StateDictOptions(full_state_dict=True)
         )
-        missing, unexpected = set_model_state_dict(
+        set_model_state_dict(
             model,
             full_sd,
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
-        if missing:
-            raise ValueError(f"Missing {missing}, unexpected {unexpected}")
 
     # Log initialization details
     if role == "miner":
@@ -575,6 +573,8 @@ def initialize_weights_inplace(
     """
     # Get model arguments
     titan_args = get_titan_model_args(hparams)
+    pp_degree = hparams.torchtitan.pp_degree
+    strict_load = pp_degree == 1
 
     if dist_helper.is_distributed():
         # 1) Rank 0 builds full reference state (CPU)
@@ -592,17 +592,12 @@ def initialize_weights_inplace(
         else:
             full_sd = None  # placeholder
 
-        # 2) Broadcast the **entire** dict to all ranks
-        obj_list = [full_sd]
-        dist.broadcast_object_list(obj_list, src=0)
-        full_sd = obj_list[0]
-
         # 4) Load strictly (no internal broadcast; everyone already has the payload)
         missing, unexpected = set_model_state_dict(
             model,
             full_sd,
             options=StateDictOptions(
-                full_state_dict=True, strict=False, broadcast_from_rank0=False
+                full_state_dict=True, strict=strict_load, broadcast_from_rank0=True
             ),
         )
         if missing:
@@ -616,9 +611,11 @@ def initialize_weights_inplace(
             ref = TitanLlama(titan_args)
             ref.args = titan_args
         ref.to_empty(device="cpu")
+
         torch.manual_seed(42)
         with torch.no_grad():
             ref.init_weights()
+
         full_sd = get_model_state_dict(
             ref, options=StateDictOptions(full_state_dict=True)
         )
@@ -628,12 +625,27 @@ def initialize_weights_inplace(
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
 
+    # # Store a quick local debug dict with different PP/DP settings to ensure correct initalization
     # local_debug = {}
+    # rank = dist_helper.rank
 
+    # _first_param = True
     # for name, param in model.named_parameters():
     #     if param is None:
     #         continue
+
+    #     if _first_param:
+    #         _first_param = False
+    #         leader_rank = dist_helper.get_mesh_leader(param)
+    #         tplr.logger.info(
+    #             f"[Rank {rank}] DTensor: {dist_helper.is_dtensor(param)}, Mesh Leader: {leader_rank}, on Leader: {rank == leader_rank}"
+    #         )
     #     if dist_helper.is_dtensor(param):
+    #         # If mesh leader (dp_rank=0), get local slice, else skip
+    #         leader_rank = dist_helper.get_mesh_leader(param)
+    #         if not rank == leader_rank:
+    #             break
+
     #         local_param = param.to_local()
     #         if local_param.numel() >= 12:
     #             local_debug[name + "_debug"] = (
@@ -676,17 +688,6 @@ def initialize_weights_inplace(
     #     with open(filepath, 'w') as f:
     #         json.dump(debug_dict, f, indent=2, default=str)
     #     tplr.logger.info(f"Saved debug dictionary to {filepath}")
-
-    # # Debug: Print first 2 values of wk layers from each rank
-    # rank = dist.get_rank() if dist.is_initialized() else 0
-    # for name, param in model.named_parameters():
-    #     if 'wk' in name:
-    #         if isinstance(param, DTensor):
-    #             local_tensor = param.to_local()
-    #             vals = local_tensor.flatten()[:2].tolist()
-    #         else:
-    #             vals = param.flatten()[:2].tolist()
-    #         print(f"[{rank}] {name}: {vals[0] if len(vals) > 0 else 'N/A'}, {vals[1] if len(vals) > 1 else 'N/A'}")
 
     # import sys; sys.exit()
 
@@ -924,6 +925,9 @@ def build_and_wire_compression_state(
     pp_scheduler,
     compression_rate: float,
     device: torch.device,
+    *,
+    recalculate_U_k: bool = True,
+    project_embedding: bool = False,
 ):
     stage = pp_scheduler._stage
 
@@ -942,14 +946,19 @@ def build_and_wire_compression_state(
     else:
         T_fixed = torch.empty((V, D), dtype=model_sample.dtype, device=device)
 
-    if rank == 0:
-        U_k = build_U_k((D, k), device=device, dtype=model_sample.dtype)
-    else:
-        U_k = torch.empty((D, k), dtype=model_sample.dtype, device=device)
-
-    # Broadcast within the mesh/PP group if available; else world
-    dist_helper.broadcast(U_k, src=0)
     dist_helper.broadcast(T_fixed, src=0)
+    
+    U_k = None
+    if recalculate_U_k:
+        if rank == 0:
+            U_k = build_U_k((D, k), device=device, dtype=model_sample.dtype)
+        else:
+            U_k = torch.empty((D, k), dtype=model_sample.dtype, device=device)
+
+        # Broadcast within the mesh/PP group if available; else world
+        dist_helper.broadcast(U_k, src=0)
 
     # Wire into the stage (this method will .to(self.device) locally)
-    stage.set_compression_attributes(U_k=U_k, T_fixed=T_fixed, project_embedding=True)
+    stage.set_compression_attributes(
+        U_k=U_k, T_fixed=T_fixed, project_embedding=project_embedding
+    )

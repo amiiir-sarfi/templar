@@ -537,7 +537,12 @@ class Miner(BaseNode, Trainer):
         # Set compression PP states if enabled
         if self.protocol_compression_enabled:
             model_factory.build_and_wire_compression_state(
-                self.model, self.pp_scheduler, self.pp_compression_ratio, self.device
+                self.model,
+                self.pp_scheduler,
+                self.pp_compression_ratio,
+                self.device,
+                recalculate_U_k=True,
+                project_embedding=False,
             )
 
         self.comms.start_commitment_fetcher()
@@ -616,6 +621,7 @@ class Miner(BaseNode, Trainer):
 
             # Offload parameters to CPU before inner_steps
             offload_start = time.time()
+            # TODO: For PP+PM, if embedding projection, offloading must happen before T_S projection
             params_offloaded, param_specs = dist_helper.get_offloaded_params(self.model)
             offload_time = time.time() - offload_start
             tplr.logger.info(f"Parameter offload to CPU took {offload_time:.4f}s")
@@ -893,7 +899,13 @@ class Miner(BaseNode, Trainer):
             for name, param in self.model.named_parameters():
                 if param is None:
                     continue
-                if isinstance(param, DT):
+
+                if dist_helper.is_dtensor(param):
+                    # If mesh leader (dp_rank=0), get local slice, else skip
+                    leader_rank = dist_helper.get_mesh_leader(param)
+                    if not self.rank == leader_rank:
+                        break
+
                     local_param = param.to_local()
                     if local_param.numel() >= 12:
                         local_debug[name + "_debug"] = (
@@ -951,6 +963,17 @@ class Miner(BaseNode, Trainer):
 
                 tplr.logger.info(
                     f"Stored debug values for window {self.current_window}"
+                )
+
+            # Reset T_fixed with new embeddings
+            if self.protocol_compression_enabled:
+                model_factory.build_and_wire_compression_state(
+                    self.model,
+                    self.pp_scheduler,
+                    self.pp_compression_ratio,
+                    self.device,
+                    recalculate_U_k=False,
+                    project_embedding=False,  # TODO: Try with rebuilding U_k
                 )
 
             # Log total window time and metrics
