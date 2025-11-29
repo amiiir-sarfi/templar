@@ -23,16 +23,14 @@ evaluator, validator, and miner components.
 
 from dataclasses import dataclass
 from collections import OrderedDict
-import json
-import os
-from logging import config
+import gc
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.pipelining.schedules import _PipelineSchedule, ScheduleGPipe
+from torch.distributed.pipelining.schedules import ScheduleGPipe
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -589,15 +587,23 @@ def initialize_weights_inplace(
             full_sd = get_model_state_dict(
                 ref, options=StateDictOptions(full_state_dict=True)
             )
+            del ref
+            gc.collect()
+
         else:
             full_sd = None  # placeholder
 
-        # 4) Load strictly (no internal broadcast; everyone already has the payload)
+        # 2) Broadcast the **entire** dict to all ranks
+        obj_list = [full_sd]
+        dist.broadcast_object_list(obj_list, src=0)
+        full_sd = obj_list[0]
+
+        # 4) Load state dict (not strict for PP>1)
         missing, unexpected = set_model_state_dict(
             model,
             full_sd,
             options=StateDictOptions(
-                full_state_dict=True, strict=strict_load, broadcast_from_rank0=True
+                full_state_dict=True, strict=strict_load, broadcast_from_rank0=False
             ),
         )
         if missing:
@@ -605,7 +611,7 @@ def initialize_weights_inplace(
 
         dist_helper.safe_barrier("weight_init", dist_helper.local_rank)
 
-    else:  # TODO: Fix: Non-distributed path init is not in sync with distributed path
+    else:
         # Single-process path
         with torch.device("meta"):
             ref = TitanLlama(titan_args)
@@ -625,71 +631,70 @@ def initialize_weights_inplace(
             options=StateDictOptions(full_state_dict=True, strict=True),
         )
 
-    # # Store a quick local debug dict with different PP/DP settings to ensure correct initalization
-    # local_debug = {}
-    # rank = dist_helper.rank
+async def load_checkpoint_from_window(
+    instance,
+    ckpt_obj,
+    window: int,
+    *,
+    description: str,
+) -> tuple[bool, int, int]:
+    """Load checkpoint for a specific window into instance.model."""
+    tplr.logger.info(f"[ckpt/{description}] Loading checkpoint at window={window}.")
+    if window is None:
+        return False, 0, 0
 
-    # _first_param = True
-    # for name, param in model.named_parameters():
-    #     if param is None:
-    #         continue
+    model = instance.model
 
-    #     if _first_param:
-    #         _first_param = False
-    #         leader_rank = dist_helper.get_mesh_leader(param)
-    #         tplr.logger.info(
-    #             f"[Rank {rank}] DTensor: {dist_helper.is_dtensor(param)}, Mesh Leader: {leader_rank}, on Leader: {rank == leader_rank}"
-    #         )
-    #     if dist_helper.is_dtensor(param):
-    #         # If mesh leader (dp_rank=0), get local slice, else skip
-    #         leader_rank = dist_helper.get_mesh_leader(param)
-    #         if not rank == leader_rank:
-    #             break
+    # Distributed path: all ranks participate in DCP load
+    if dist_helper.is_distributed():
+        rank = dist_helper.rank
+        world_size = dist_helper.world_size
 
-    #         local_param = param.to_local()
-    #         if local_param.numel() >= 12:
-    #             local_debug[name + "_debug"] = (
-    #                 local_param.flatten()[10:12].detach().cpu().tolist()
-    #             )
-    #     else:
-    #         if param.numel() >= 12:
-    #             local_debug[name + "_debug"] = (
-    #                 param.flatten()[10:12].detach().cpu().tolist()
-    #             )
+        tplr.logger.info(
+            f"[ckpt/{description}] [rank {rank}/{world_size}] "
+            "invoking DCP download_and_load directly on parallel model."
+        )
+        
+        res = await ckpt_obj.download_and_load(
+            model=model,
+            window=window,
+            shared_fs=True,
+            process_group=None,
+            prefer_highest_staked=True,
+        )
 
-    # # Gather these tiny dicts to master and merge so rank-0 uploads a complete view
-    # gathered_dbg = dist_helper.gather_object(
-    #     local_debug,
-    #     object_list=[None] * dist_helper.world_size if dist_helper.is_master else None,
-    #     dst=0,
-    # )
+        if res is None:
+            return False, 0, 0
 
-    # if dist_helper.is_master:
-    #     debug_dict = {}
+        ckpt_sync_win, ckpt_global_step = res
 
-    #     # Merge param slices from all PP stages so ALL layers are represented
-    #     if gathered_dbg is not None:
-    #         for d in gathered_dbg:
-    #             if d:
-    #                 debug_dict.update(d)
+        # Ensure all ranks see a consistent model state before continuing
+        dist_helper.safe_barrier(
+            "ckpt_after_dcp_load", getattr(instance, "local_rank", 0)
+        )
 
-    #     # Get PP and DP_shard values from hparams
-    #     tt = getattr(hparams, "torchtitan", SimpleNamespace())
-    #     pp_degree = int(getattr(tt, "pp_degree", 1))
-    #     dp_shard = int(getattr(tt, "dp_shard", 1))
+    # Single‑process / non‑distributed path
+    else:
+        res = await ckpt_obj.download_and_load(
+            model=model,
+            window=window,
+            shared_fs=True,  # safe even for single process; just mirrors layout
+            process_group=None,
+            prefer_highest_staked=True,
+        )
 
-    #     # Create debug_dicts directory if it doesn't exist
-    #     debug_dir = "/root/templar/debug_dicts"
-    #     os.makedirs(debug_dir, exist_ok=True)
+        if res is None:
+            return False, 0, 0
 
-    #     # Save debug dictionary as JSON file
-    #     filename = f"pp_{pp_degree}_dp_{dp_shard}.json"
-    #     filepath = os.path.join(debug_dir, filename)
-    #     with open(filepath, 'w') as f:
-    #         json.dump(debug_dict, f, indent=2, default=str)
-    #     tplr.logger.info(f"Saved debug dictionary to {filepath}")
+        ckpt_sync_win, ckpt_global_step = res
 
-    # import sys; sys.exit()
+    tplr.logger.info(
+        f"[ckpt/{description}] Model initialized from checkpoint: "
+        f"ckpt_sync_win={ckpt_sync_win}, ckpt_global_step={ckpt_global_step}."
+    )
+
+    instance.model_initialized = True
+    return True, ckpt_sync_win, ckpt_global_step
 
 
 def _get_unwrapped_model(model: nn.Module) -> "TitanLlama":
@@ -947,7 +952,7 @@ def build_and_wire_compression_state(
         T_fixed = torch.empty((V, D), dtype=model_sample.dtype, device=device)
 
     dist_helper.broadcast(T_fixed, src=0)
-    
+
     U_k = None
     if recalculate_U_k:
         if rank == 0:

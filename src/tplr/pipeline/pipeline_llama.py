@@ -30,7 +30,7 @@ from torchtitan.distributed.pipeline_parallel import (
 from torchtitan.protocols.train_spec import BaseModelArgs, ParallelizeFunction
 
 from tplr.pipeline.pipeline_stage import PipelineStageProtocolCompression
-import tplr.logging as logger
+import tplr.logging as logging
 
 
 __all__ = [
@@ -175,7 +175,7 @@ def pipeline_module_split(
             module_names,
             num_stages,
         )
-        logger.info(
+        logging.logger.info(
             f"PP rank {pp_rank} is building stage_idx {stage_idx} "
             f"with modules {module_names}"
         )
@@ -271,7 +271,7 @@ def pipeline_llama(
             num_virtual_stages, num_layers, input_weight, output_weight
         )
     for i, stage_ms in enumerate(module_names_per_stage):
-        logger.debug(f"Stage {i}: {stage_ms}")
+        logging.logger.debug(f"Stage {i}: {stage_ms}")
 
     stages, model_parts = pipeline_module_split(
         model,

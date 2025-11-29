@@ -903,8 +903,9 @@ class Miner(BaseNode, Trainer):
                 if dist_helper.is_dtensor(param):
                     # If mesh leader (dp_rank=0), get local slice, else skip
                     leader_rank = dist_helper.get_mesh_leader(param)
-                    if not self.rank == leader_rank:
-                        break
+                    if leader_rank is None or self.rank != leader_rank:
+                        # Not the owner for this shard; another rank will share it
+                        continue
 
                     local_param = param.to_local()
                     if local_param.numel() >= 12:

@@ -36,6 +36,7 @@ from wandb.sdk.wandb_run import Run
 import tplr
 from tplr.compress import unpack_12bit_indices
 from tplr.distributed import dist_helper
+from tplr.model_factory import load_checkpoint_from_window
 
 if TYPE_CHECKING:
     from neurons.miner import Miner
@@ -554,20 +555,19 @@ async def load_checkpoint_with_fallback(
 
     if latest_current_window is not None:
         # Current version checkpoint exists, load it
-        res = await instance.ckpt.download_and_load(
-            model=instance.model,
-            window=latest_current_window,
-            shared_fs=True,
-            process_group=None,
-            prefer_highest_staked=True,
+        ok, sync_win, gstep = await load_checkpoint_from_window(
+            instance,
+            instance.ckpt,
+            latest_current_window,
+            description="current",
         )
-        if res is not None:
+        if ok:
             ckpt_ok = True
-            ckpt_sync_win, ckpt_global_step = res
-            instance.model_initialized = True  # Model now has real weights
+            ckpt_sync_win = sync_win
+            ckpt_global_step = gstep
             tplr.logger.info(
-                f"Loaded current version checkpoint (window={ckpt_sync_win}, "
-                f"global_step={ckpt_global_step})"
+                f"[ckpt] Loaded current version checkpoint "
+                f"(window={ckpt_sync_win}, global_step={ckpt_global_step})"
             )
 
     # If no current version checkpoint and bootstrap is configured, try that
@@ -592,20 +592,20 @@ async def load_checkpoint_with_fallback(
             )
 
         if bootstrap_window is not None:
-            res = await bootstrap_ckpt.download_and_load(
-                model=instance.model,
-                window=bootstrap_window,
-                shared_fs=True,
-                process_group=None,
-                prefer_highest_staked=True,
+            ok, sync_win, gstep = await load_checkpoint_from_window(
+                instance,
+                bootstrap_ckpt,
+                bootstrap_window,
+                description=f"bootstrap:{instance.bootstrap_version}",
             )
-            if res is not None:
+            if ok:
                 ckpt_ok = True
                 from_bootstrap = True
-                ckpt_sync_win, ckpt_global_step = res
-                instance.model_initialized = True  # Model now has real weights
+                ckpt_sync_win = sync_win
+                ckpt_global_step = gstep
                 tplr.logger.info(
-                    f"Loaded bootstrap checkpoint (version={instance.bootstrap_version}, "
+                    f"[ckpt] Loaded bootstrap checkpoint "
+                    f"(version={instance.bootstrap_version}, "
                     f"window={ckpt_sync_win}, global_step={ckpt_global_step})"
                 )
 
@@ -619,15 +619,17 @@ async def load_checkpoint_with_fallback(
             if bootstrap_start_window is not None:
                 ckpt_global_step = ckpt_sync_win - bootstrap_start_window
                 tplr.logger.info(
-                    f"Bootstrap checkpoint has no global_step, calculated as {ckpt_global_step} "
+                    f"[ckpt] Bootstrap checkpoint had no global_step; "
+                    f"calculated as {ckpt_global_step} "
                     f"(window {ckpt_sync_win} - bootstrap start {bootstrap_start_window})"
                 )
             else:
                 # Fallback if we can't get bootstrap start_window
                 ckpt_global_step = 0
                 tplr.logger.info(
-                    f"Bootstrap checkpoint has no global_step and couldn't fetch bootstrap start_window, "
-                    f"setting to 0 (will be corrected during catch-up)"
+                    "[ckpt] Bootstrap checkpoint has no global_step and could not "
+                    "fetch bootstrap start_window; setting global_step to 0 "
+                    "(will be corrected during catch-up)."
                 )
         else:
             # For current version checkpoints, calculate from window difference
@@ -665,13 +667,13 @@ async def handle_checkpoint_catchup(  # TODO: Fix checkpoint catchup with PP
     # Decide catch-up windows and run catch-up on ALL ranks
     # When loading from bootstrap, we always need to catch up from start_window
     # to ensure we're using current version's gradients
-    if not ckpt_ok and False:
+    if not ckpt_ok:
         # No checkpoint found, catch up from start_window
         tplr.logger.info("No checkpoint found, will catch up from start_window")
         await catchup_with_aggregation_server(
             instance, instance.start_window, aggregator_device=aggregator_device
         )
-    elif from_bootstrap and False:
+    elif from_bootstrap:
         # Loading from bootstrap, catch up from start_window with current version gradients
         tplr.logger.info(
             f"Loaded bootstrap checkpoint, catching up from start_window "
@@ -680,7 +682,7 @@ async def handle_checkpoint_catchup(  # TODO: Fix checkpoint catchup with PP
         await catchup_with_aggregation_server(
             instance, instance.start_window, aggregator_device=aggregator_device
         )
-    elif ckpt_sync_win < instance.current_window and False:
+    elif ckpt_sync_win < instance.current_window:
         # Current version checkpoint is behind, catch up from checkpoint window
         catch_up_start = max(ckpt_sync_win, instance.start_window)
         tplr.logger.info(
@@ -887,7 +889,7 @@ async def catchup_with_aggregation_server(
                         device=str(catchup_device),
                         local=False,
                         stale_retention=10,
-                        totalks=instance.totalks,
+                        totalks=getattr(instance, "totalks_global", instance.totalks),
                         compressor=instance.compressor,
                         time_min=time_min,
                         time_max=time_max,

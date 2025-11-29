@@ -42,8 +42,8 @@
     "eval_lr_factor": 1.0,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": null,
-    "checkpoint_init_window": null,
+    "checkpoint_init_version": "dev-6q8aih2v",
+    "checkpoint_init_window": 66595,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
@@ -107,6 +107,6 @@
       "option": "op"
     },
 
-    "pp_compression_ratio": 0.0625
+    "pp_compression_ratio": 1
   }
 }

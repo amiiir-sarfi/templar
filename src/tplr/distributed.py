@@ -20,11 +20,11 @@ Distributed training utilities for multi-GPU training.
 """
 
 import os
+import json
 import time
 from contextlib import nullcontext
 from datetime import timedelta
-from typing import Any
-
+from typing import Any, Iterable
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor as DT
@@ -75,15 +75,34 @@ class DistributedHelper:
     def get_mesh_group(self, x):
         if not self.is_dtensor(x):
             return None
+
         mesh = getattr(x, "device_mesh", None)
-        if mesh is None:
+        placements = getattr(x, "placements", None)
+        if mesh is None or placements is None:
             spec = getattr(x, "_spec", None)
-            mesh = getattr(spec, "mesh", None)
-        if mesh is not None:
-            try:
+            mesh = getattr(spec, "mesh", mesh)
+            placements = getattr(spec, "placements", placements)
+
+        if mesh is None:
+            return dist.group.WORLD if self.is_distributed() else None
+
+        mesh_dim = None
+        for p in placements or []:
+            dim = getattr(p, "dim", None)
+            if dim is not None:
+                mesh_dim = dim
+                break
+
+        try:
+            if mesh_dim is not None:
+                return mesh.get_group(mesh_dim)
+            if mesh.ndim == 1:
                 return mesh.get_group()
-            except Exception:
-                pass
+            # Fallback: use the first dimension instead of the world group
+            return mesh.get_group(mesh_dim=0)
+        except Exception:
+            pass
+
         return dist.group.WORLD if self.is_distributed() else None
 
     def group_leader_rank(self, group) -> int:
@@ -611,6 +630,7 @@ class DistributedHelper:
         tplr.logger.info(
             f"[ParamRestore] restored {len(params_offloaded)} params in {time.time() - t0:.3f}s"
         )
+
 
 
 # Global instance for convenience
