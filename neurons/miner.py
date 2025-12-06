@@ -726,8 +726,13 @@ class Miner(BaseNode, Trainer):
             # ------------------------------------------------------------
             gradient = {}
             processed_state_dict = {}
+            processed_state_dict_time = 0.0  # NEW: timing for merge+CPU move
+
             if self.is_master:
                 assert gathered is not None
+                process_start = tplr.T()  # NEW: start timer
+
+                # 2️⃣ merge shards on rank‑0 (pure compute, no I/O)
                 for i, shard in enumerate(gathered):
                     if shard is not None:
                         gradient.update(shard)
@@ -761,11 +766,18 @@ class Miner(BaseNode, Trainer):
                     k: (v.to("cpu") if isinstance(v, torch.Tensor) else v)
                     for k, v in gradient.items()
                 }
+
+                processed_state_dict_time = tplr.T() - process_start  # NEW: stop timer
+                tplr.logger.info(
+                    f"{tplr.P(step_window, processed_state_dict_time)} "
+                    "Built CPU processed_state_dict (merge + metadata + device transfer)"
+                )
             else:
                 # non-master ranks simply wait; they don't upload
                 put_time = 0.0
                 if self.world_size > 1:
                     del gathered  # Free gathered list on non-master ranks too
+
 
             tplr.logger.info(f"Stopped accumulating: {n_batches} batches")
             dist_helper.safe_barrier("post_gather", self.local_rank)
@@ -1015,6 +1027,7 @@ class Miner(BaseNode, Trainer):
                         "miner/timing/gather": gather_time,
                         "miner/timing/put": put_time,
                         "miner/timing/model_update": model_update_time,
+                        "miner/timing/processed_state_dict": processed_state_dict_time,
                         # Existing metrics
                         "miner/window_entry_loss": window_entry_loss,
                         "miner/tokens_per_sec": tokens_per_sec,
@@ -1073,6 +1086,7 @@ class Miner(BaseNode, Trainer):
                         "put_time": put_time,
                         "model_update_time": model_update_time,
                         "tokens_per_sec": tokens_per_sec,
+                        "processed_state_dict_time": processed_state_dict_time,
                     },
                 )
                 tplr.logger.info("Finished metrics logging call for miner")
