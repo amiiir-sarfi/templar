@@ -6,7 +6,7 @@ import numpy as np
 
 
 def main():
-    root = Path("/root/datasets/dclm_tokenized")
+    root = Path("~/datasets/dclm_tokenized").expanduser()
     for npy in sorted(root.glob("train_*.npy")):
         m = re.fullmatch(r"train_(\d{6})\.npy", npy.name)
         if not m:

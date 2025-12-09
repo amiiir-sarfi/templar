@@ -39,6 +39,8 @@ class DistributedHelper:
         self.rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+        self.local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", str(self.world_size)))
+        self.num_nodes = max(1, self.world_size // self.local_world_size)
         self.is_master = self.rank == 0
         self.device = None
 

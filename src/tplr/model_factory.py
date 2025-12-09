@@ -27,6 +27,7 @@ import gc
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from fastapi import params
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -192,6 +193,8 @@ def create_job_config(
 
     # Build Training config
     training = Training(
+        local_batch_size=hparams.micro_batch_size,
+        global_batch_size=hparams.batch_size,
         seq_len=hparams.sequence_length,
         compile=compile_default,
         enable_cpu_offload=enable_cpu_offload_default,
@@ -400,6 +403,20 @@ def create_meta_model(
     with torch.device("meta"):
         model = TitanLlama(titan_args)
         model.args = titan_args
+
+    if dist_helper.is_master:
+        # log number of params
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+
+        tplr.logger.info(
+            f"Model parameters: "
+            f"{total_params:,} total "
+            f"({total_params/1e6:.1f}M, {total_params/1e9:.2f}B); "
+            f"{trainable_params:,} trainable"
+        )
 
     if pdims.pp_enabled:
         if pp_device is None:
@@ -649,6 +666,8 @@ async def load_checkpoint_from_window(
     if dist_helper.is_distributed():
         rank = dist_helper.rank
         world_size = dist_helper.world_size
+        num_nodes = dist_helper.num_nodes
+        shared_fs = num_nodes == 1
 
         tplr.logger.info(
             f"[ckpt/{description}] [rank {rank}/{world_size}] "
@@ -658,7 +677,7 @@ async def load_checkpoint_from_window(
         res = await ckpt_obj.download_and_load(
             model=model,
             window=window,
-            shared_fs=True,
+            shared_fs=shared_fs,
             process_group=None,
             prefer_highest_staked=True,
         )
