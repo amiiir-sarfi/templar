@@ -17,7 +17,7 @@ __all__ = [
     "PipelineStageProtocolCompression",
 ]
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("templar")
 
 
 _HEADER_FIELDS = 6  # [compressed_flag, B, S, D, rank, comp_numel]
@@ -112,6 +112,7 @@ class PipelineStageProtocolCompression(PipelineStage):
             if embed is not None and isinstance(embed, nn.Embedding):
                 project_embeddings_rowwise_inplace(embed, self.U_k)
 
+        logger.info(f"[PM_stage] U_k shape: {self.U_k.shape}, T_fixed shape: {self.T_fixed.shape}")
     # ---- Protocol compression (rowwise) ----
     def _compress(self, X: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
         # X: [B, S, D], token_indices: [B, S]
@@ -154,26 +155,6 @@ class PipelineStageProtocolCompression(PipelineStage):
         rank = self.U_k.shape[1]
         return B * S * rank
 
-    def _shape_inference(
-        self,
-        args: tuple[Any, ...],
-        kwargs: Optional[dict[str, Any]] = None,
-    ):
-        """
-        Same as parent, but for non-first stages we synthesize a 2nd input meta for token_indices (B,S).
-        """
-        outputs_meta = super()._shape_inference(args, kwargs)
-        # After parent fills self.inputs_meta:
-        assert self.inputs_meta is not None
-        if not self.is_first:
-            # inputs_meta[0] is the activation meta with shape [B,S,D]
-            act_meta = self.inputs_meta[0]
-            if isinstance(act_meta, torch.Tensor) and act_meta.dim() == 3:
-                B, S = act_meta.shape[:2]
-                tok_meta = torch.zeros(B, S, dtype=torch.long, device="meta")
-                self.inputs_meta = (act_meta, tok_meta)
-        return outputs_meta
-
     def _prepare_forward_infra(
         self,
         num_microbatches: int,
@@ -200,27 +181,26 @@ class PipelineStageProtocolCompression(PipelineStage):
                 # activation meta [B,S,D] comes from parent shape inference
                 act_meta = self.inputs_meta[0]
                 assert isinstance(act_meta, torch.Tensor) and act_meta.dim() == 3
-                packed_size = self._calculate_packed_size(tuple(act_meta.shape))
-
-                act_buf = torch.empty(
-                    packed_size, dtype=act_meta.dtype, device=self.device
-                )
-                if self.has_backward:
-                    act_buf.requires_grad_(True)
-
                 B, S = act_meta.shape[:2]
-                tok_buf = torch.empty(B, S, dtype=torch.long, device=self.device)
+
+                packed_numel = self._calculate_packed_size(tuple(act_meta.shape))  # B*S*k
+                packed_dtype = act_meta.dtype  # usually bf16 in your case
+
+                packed_nbytes = packed_numel * torch.empty((), dtype=packed_dtype).element_size()
+                tok_nbytes = (B * S) * torch.empty((), dtype=torch.long).element_size()
+                pad = (-packed_nbytes) % torch.empty((), dtype=torch.long).element_size()
+
+                combo_buf = torch.empty(
+                    packed_nbytes + pad + tok_nbytes,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
 
                 self.args_recv_info[chunk_id] = (
                     _RecvInfo(
-                        f"recv_packed_act_{self.stage_index}_from_{self.stage_index - 1}",
+                        f"recv_combo_{self.stage_index}_from_{self.stage_index - 1}",
                         self.stage_index - 1,
-                        act_buf,
-                    ),
-                    _RecvInfo(
-                        f"recv_tokens_{self.stage_index}_from_{self.stage_index - 1}",
-                        self.stage_index - 1,
-                        tok_buf,
+                        combo_buf,
                     ),
                 )
 
@@ -238,19 +218,26 @@ class PipelineStageProtocolCompression(PipelineStage):
             return super()._retrieve_recv_activations(fwd_chunk_id)
 
         recv_infos = self.args_recv_info[fwd_chunk_id]
+        combo = self._map_tensor_from_recv_info(recv_infos)
+        if isinstance(combo, tuple):
+            (combo,) = combo
 
-        # ✅ Wait for irecvs and fetch the *filled* tensors
-        mapped = self._map_tensor_from_recv_info(recv_infos)
-        if not isinstance(mapped, tuple):
-            mapped = (mapped,)  # when there's a single tensor
+        act_meta = self.inputs_meta[0]
+        B, S = act_meta.shape[:2]
 
-        # Expect: (packed_activation_flat, token_indices)
-        packed, token_indices = mapped
+        packed_numel = self._calculate_packed_size(tuple(act_meta.shape))
+        packed, token_indices = self._unpack_packed_and_tokens(
+            combo,
+            packed_numel=packed_numel,
+            packed_dtype=act_meta.dtype,
+            tokens_shape=(B, S),
+        )
 
-        X = self._decompress(packed, token_indices)
+        with torch.no_grad():
+            X = self._decompress(packed, token_indices)
+
         X = X.detach().requires_grad_(True)
 
-        # Cache tokens for forwarding to the next stage
         self._mb_token_indices[fwd_chunk_id] = token_indices.detach()
         return (X,)
 
@@ -289,6 +276,56 @@ class PipelineStageProtocolCompression(PipelineStage):
 
         return super().forward_one_chunk(fwd_chunk_id, args, kwargs)
 
+    def _pack_packed_and_tokens(
+        self, packed: torch.Tensor, tokens: torch.Tensor
+    ) -> torch.Tensor:
+        packed = packed.contiguous()
+        tokens = tokens.contiguous()
+
+        packed_nbytes = packed.numel() * packed.element_size()     # bf16 => *2
+        tok_nbytes = tokens.numel() * tokens.element_size()        # int64 => *8
+
+        align = tokens.element_size()  # 8
+        pad = (-packed_nbytes) % align
+
+        combo = torch.empty(
+            packed_nbytes + pad + tok_nbytes,
+            dtype=torch.uint8,
+            device=packed.device,
+        )
+
+        # write packed bytes
+        combo[:packed_nbytes].view(packed.dtype).copy_(packed.view(-1))
+
+        # write token bytes (after padding)
+        start = packed_nbytes + pad
+        combo[start:start + tok_nbytes].view(tokens.dtype).view(tokens.shape).copy_(tokens)
+
+        return combo
+
+
+    def _unpack_packed_and_tokens(
+        self,
+        combo: torch.Tensor,               # uint8 buffer
+        *,
+        packed_numel: int,
+        packed_dtype: torch.dtype,
+        tokens_shape: tuple[int, int],     # (B,S)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, S = tokens_shape
+
+        packed_nbytes = packed_numel * torch.empty((), dtype=packed_dtype).element_size()
+        tok_nbytes = (B * S) * torch.empty((), dtype=torch.long).element_size()
+
+        align = torch.empty((), dtype=torch.long).element_size()  # 8
+        pad = (-packed_nbytes) % align
+
+        packed = combo[:packed_nbytes].view(packed_dtype)  # 1D [packed_numel]
+        start = packed_nbytes + pad
+        token_indices = combo[start:start + tok_nbytes].view(torch.long).view(B, S)
+
+        return packed, token_indices
+
     # Send compressed activations AND token indices to next stage
     def get_fwd_send_ops(self, fwd_chunk_id: int) -> list[dist.P2POp]:
         output_tuple, _ = self.fwd_cache[fwd_chunk_id]
@@ -308,8 +345,11 @@ class PipelineStageProtocolCompression(PipelineStage):
                 continue
 
             # Compress activation with decoupling
-            packed = self._compress(out, self._mb_token_indices[fwd_chunk_id])
+            with torch.no_grad():
+                packed = self._compress(out, self._mb_token_indices[fwd_chunk_id]).contiguous()
 
+            # Combine compressed activations and tokens for 1 P2P send
+            combo = self._pack_packed_and_tokens(packed, tokens)
             for dst in dst_stages:
                 peer_rank = self.stage_index_to_group_rank[dst]
                 peer_global_rank = (
@@ -317,10 +357,7 @@ class PipelineStageProtocolCompression(PipelineStage):
                     if self.group is None
                     else dist.get_global_rank(self.group, peer_rank)
                 )
-                # 1) send packed activation
-                ops.append(dist.P2POp(dist.isend, packed, peer_global_rank, self.group))
-                # 2) send token indices as a separate tensor
-                ops.append(dist.P2POp(dist.isend, tokens, peer_global_rank, self.group))
+                ops.append(dist.P2POp(dist.isend, combo, peer_global_rank, self.group))
 
         return ops
 
@@ -338,7 +375,8 @@ class PipelineStageProtocolCompression(PipelineStage):
 
         for grad, grad_recv_stage in zip(grads_input, self.grad_send_info):
             if isinstance(grad, torch.Tensor) and grad_recv_stage is not None:
-                packed_grad = self._compress_grad(grad)
+                with torch.no_grad():
+                    packed_grad = self._compress_grad(grad).contiguous()
                 peer_rank = self.stage_index_to_group_rank[grad_recv_stage]
                 peer_global_rank = (
                     peer_rank
