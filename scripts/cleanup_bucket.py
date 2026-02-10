@@ -52,7 +52,10 @@ async def cleanup_bucket():
     account_id = os.environ["R2_GRADIENTS_ACCOUNT_ID"]
     access_key_id = os.environ["R2_GRADIENTS_WRITE_ACCESS_KEY_ID"]
     secret_access_key = os.environ["R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY"]
-
+    print(account_id)
+    print(access_key_id)
+    print(secret_access_key)
+    print(tplr.config.client_config.__dict__)
     # Initialize S3 client
     session = get_session()
     async with session.create_client(
@@ -63,6 +66,7 @@ async def cleanup_bucket():
         aws_secret_access_key=secret_access_key,
         config=tplr.config.client_config,
     ) as client:
+        print("created client")
         logger.info("Listing objects in bucket...")
 
         # Use paginator to handle buckets with >1000 objects

@@ -45,7 +45,6 @@ from neurons import BaseNode, Trainer
 from neurons.base_node import CPU_COUNT
 from tplr import model_factory
 from tplr.distributed import dist_helper
-from tplr.pipeline import PipelineStageProtocolCompression
 
 # GPU optimizations
 torch.manual_seed(42)
@@ -100,6 +99,11 @@ class Miner(BaseNode, Trainer):
             "--dp_degree", type=int, default=None, help="Override DP degree."
         )
         parser.add_argument(
+            "--local_hparams",
+            action="store_true",
+            help="Use local hparams.",
+        )
+        parser.add_argument(
             "--device", type=str, default="cuda", help="Device to use for training"
         )
         parser.add_argument(
@@ -122,11 +126,6 @@ class Miner(BaseNode, Trainer):
             "--test",
             action="store_true",
             help="Test mode - use all peers without filtering",
-        )
-        parser.add_argument(
-            "--local",
-            action="store_true",
-            help="Local run - use toy model, small enough for a laptop.",
         )
         parser.add_argument(
             "--profile-iters",
@@ -233,8 +232,8 @@ class Miner(BaseNode, Trainer):
 
     def _load_hparams(self):
         """Load hparams and handle optional batch size override."""
-        self.config.local = cast(bool, self.config.local)
-        self.hparams = tplr.load_hparams(use_local_run_hparams=self.config.local)
+        self.config.local_hparams = cast(bool, self.config.local_hparams)
+        self.hparams = tplr.load_hparams(use_local_run_hparams=self.config.local_hparams)
 
         if self.config.actual_batch_size is not None:
             tplr.logger.info(

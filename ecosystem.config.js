@@ -2,12 +2,13 @@
 require('dotenv').config({ path: '.env' });
 
 const { execSync } = require('child_process');
-const RANDOM_SUFFIX = execSync(
-  "cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1"
-)
-  .toString()
-  .trim();
+// const RANDOM_SUFFIX = execSync(
+//   "cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1"
+// )
+//   .toString()
+//   .trim();
 
+const RANDOM_SUFFIX = "hfl10ssb";
 const PROJECT_NAME = `test_${RANDOM_SUFFIX}`;
 
 module.exports = {
@@ -31,7 +32,8 @@ module.exports = {
         "--use_wandb",
         "--project", PROJECT_NAME,
         "--pp_degree", "2",
-        "--dp_degree", "2"
+        "--dp_degree", "2",
+        "--local_hparams" // Don't use compression
       ],
       env: {
         ...process.env,
@@ -39,32 +41,32 @@ module.exports = {
         CUDA_VISIBLE_DEVICES: "1,2,3,4"
       }
     },
-    // {
-    //   name            : "TM2",
-    //   exec_mode       : "fork",
-    //   exec_interpreter: "none",
-    //   script          : "torchrun",
-    //   args: [
-    //     "--standalone",
-    //     "--nnodes", "1",
-    //     "--nproc_per_node", "2",
-    //     "neurons/miner.py",
-    //     "--wallet.name", "miner1",
-    //     "--wallet.hotkey", "default",
-    //     "--device", "cuda",
-    //     "--subtensor.network", "local",
-    //     "--netuid", "2",
-    //     "--use_wandb",
-    //     "--project", PROJECT_NAME,
-    //     "--pp_degree", "1",
-    //     "--dp_degree", "2"
-    //   ],
-    //   env: {
-    //     ...process.env,
-    //     PROJECT_NAME,
-    //     CUDA_VISIBLE_DEVICES: "3,4"
-    //   }
-    // },
+    {
+      name            : "TM2",
+      exec_mode       : "fork",
+      exec_interpreter: "none",
+      script          : "torchrun",
+      args: [
+        "--standalone",
+        "--nnodes", "1",
+        "--nproc_per_node", "2",
+        "neurons/miner.py",
+        "--wallet.name", "miner1",
+        "--wallet.hotkey", "default",
+        "--device", "cuda",
+        "--subtensor.network", "local",
+        "--netuid", "2",
+        "--use_wandb",
+        "--project", PROJECT_NAME,
+        "--pp_degree", "2",
+        "--dp_degree", "1"
+      ],
+      env: {
+        ...process.env,
+        PROJECT_NAME,
+        CUDA_VISIBLE_DEVICES: "5,6"
+      }
+    },
     // {
     //   name            : "TM3",
     //   exec_mode       : "fork",
@@ -127,7 +129,7 @@ module.exports = {
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "4",
+        "--nproc_per_node", "1",
         "neurons/validator.py",
         "--wallet.name", "validator",
         "--wallet.hotkey", "default",
@@ -140,7 +142,7 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "0,5,6,7"
+        CUDA_VISIBLE_DEVICES: "0"
       }
     }
   ]

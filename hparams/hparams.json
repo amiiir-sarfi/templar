@@ -3,12 +3,12 @@
     "project": "dough",
     "tokenizer_name": "togethercomputer/LLaMA-2-7B-32K",
     "sequence_length": 2048,
-    "micro_batch_size": 16,
-    "target_batch_size": 128,
-    "batch_size": 128,
+    "micro_batch_size": 8,
+    "target_batch_size": 32,
+    "batch_size": 32,
     "inner_steps": 5,
     "outer_learning_rate": 1,
-    "blocks_per_window": 20,
+    "blocks_per_window": 2,
     "windows_per_weights": 5,
     "outer_steps_per_shard": 500, 
     "momentum_decay": 0.95,
@@ -18,10 +18,10 @@
     "binary_score_ma_alpha": 0.05,
     "moving_average_window": 5,
     "missing_gradient_penalty_score": -99.0,
-    "model_size": "2B",
+    "model_size": "150M",
     "weight_decay": 0.1,
     "validator_offset": 1,
-    "checkpoint_frequency": 5,
+    "checkpoint_frequency": 100000,
     "gather_peer_count": 20,
     "gather_share": 0.75,
     "gather_top_ratio": 2.0,
@@ -42,7 +42,7 @@
     "eval_lr_factor": 1.0,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": null,
+    "checkpoint_init_version": "dev-hfl10ssb",
     "checkpoint_init_window": null,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
@@ -85,9 +85,9 @@
     "cp_degree": 1,
 
     "dp_replicate": 1,
-    "dp_shard": 4,
+    "dp_shard": 1,
 
-    "compile": false,
+    "compile": true,
     "enable_cpu_offload": false,
 
     "mixed_precision_param": "bfloat16",
@@ -107,6 +107,6 @@
       "option": "op"
     },
 
-    "pp_compression_ratio": 1
+    "pp_compression_ratio": 0.01
   }
 }
